@@ -16,7 +16,7 @@ This repository contains two scripts: [qGen.py]() and [effuzz.py]().
 - You can first run `effuzz.py` to check for interesting methods allowed for your session:
 
 ```shell
-python3 effuzz.py --introspection /path/to/introspection_file.json --url https://example.com/graphql
+python3 effuzz.py --introspection /path/to/introspection_schema.json --url https://example.com/graphql
 
 [redacted]
 getAllTests    [Status: 401] [Size: 32] [Words: 5] [Lines: 1]
@@ -27,7 +27,7 @@ getAllConfigs   [Status: 200] [Size: 48] [Words: 15] [Lines: 1] #<----- You also
 - Once you obtained those methods who might interest you, you can run `qGen.py` and generate a query for that method:
 
 ```shell
-python3 qGen.py --introspection /path/to/introspection_file.json
+python3 qGen.py --introspection /path/to/introspection_schema.json
 
 [redacted]
 qGen $ use getAllUsers
