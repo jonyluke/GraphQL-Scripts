@@ -24,7 +24,7 @@ getAllUsers    [Status: 400] [Size: 261] [Words: 25] [Lines: 1] #<----- This ind
 getAllConfigs   [Status: 200] [Size: 48] [Words: 15] [Lines: 1] #<----- You also have permissions for this one
 ```
   
-- Once you obtained those methods who might interest you, you can run `qGen.py` and generate a query for that method:
+- Once you obtained those methods which might interest you, you can run `qGen.py` and generate a query for that method:
 
 ```shell
 python3 qGen.py --introspection /path/to/introspection_schema.json
