@@ -130,4 +130,3 @@ Troubleshooting
   - That the server responds to GraphQL introspection and returns JSON containing `__schema`.
 - If you prefer to avoid network fetching, run the introspection query separately (using curl, GraphiQL, or another client), save the JSON, and pass it with `--introspection`.
 - If a generated query is too large for your client, consider manually trimming fields or selecting nested fields selectively.
-```
