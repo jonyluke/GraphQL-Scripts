@@ -51,7 +51,8 @@ def load_introspection():
         except Exception as e:
             print(f"❌ Error reading JSON: {e}\n")
 
-# Introspection query used when obtaining schema from endpoint
+# Introspection query used when obtaining schema from endpoint.
+# NOTE: includes inputFields for input objects so we can expand them inline.
 INTROSPECTION_QUERY = """
 query IntrospectionQuery {
   __schema {
@@ -67,6 +68,15 @@ query IntrospectionQuery {
           type { kind name ofType { kind name ofType { kind name } } }
         }
         type { kind name ofType { kind name } }
+      }
+      inputFields {
+        name
+        description
+        defaultValue
+        type { kind name ofType { kind name ofType { kind name } } }
+      }
+      enumValues {
+        name
       }
     }
   }
@@ -122,30 +132,48 @@ def save_introspection_file(data: Dict[str, Any], path: str = "introspection_sch
     except Exception as e:
         print(f"⚠️ Failed to save introspection to {path}: {e}")
 
-# Extract query fields
+# Extract query and mutation fields
 def extract_graphql_queries(introspection):
     try:
         types = introspection["data"]["__schema"]["types"]
     except Exception:
         return []
 
-    query_type_name = introspection["data"]["__schema"]["queryType"]["name"]
-    query_type = next((t for t in types if t.get("name") == query_type_name), None)
+    methods = []
 
-    if not query_type:
-        return []
+    # Extract query fields (if present)
+    query_type = introspection["data"]["__schema"].get("queryType")
+    query_type_name = query_type.get("name") if isinstance(query_type, dict) else query_type
+    if query_type_name:
+        qtype = next((t for t in types if t.get("name") == query_type_name), None)
+        if qtype and "fields" in qtype:
+            for f in qtype["fields"]:
+                f_copy = f.copy()
+                f_copy["_root"] = "query"
+                methods.append(f_copy)
 
-    return query_type.get("fields", [])
+    # Extract mutation fields (if present)
+    mutation_type = introspection["data"]["__schema"].get("mutationType")
+    mutation_type_name = mutation_type.get("name") if isinstance(mutation_type, dict) else mutation_type
+    if mutation_type_name:
+        mtype = next((t for t in types if t.get("name") == mutation_type_name), None)
+        if mtype and "fields" in mtype:
+            for f in mtype["fields"]:
+                f_copy = f.copy()
+                f_copy["_root"] = "mutation"
+                methods.append(f_copy)
+
+    return methods
 
 
 # Follow NON_NULL / LIST / etc.
 def resolve_type(t):
-    while t.get("ofType") is not None:
+    # t is expected to be a dict with possible 'ofType' recursing
+    while isinstance(t, dict) and t.get("ofType") is not None:
         t = t["ofType"]
     return t
 
-
-# Recursively build full field tree for the query
+# Recursively build full field tree for the query (response shape)
 def build_field_tree(field_type, types, depth=0, visited=None):
     if visited is None:
         visited = set()
@@ -206,19 +234,145 @@ def stringify_type(t):
     else:
         return t.get("name", "Unknown")
 
+# Helpers to build inline input objects with example values
+def build_input_object(type_ref, types, depth=0, visited=None):
+    """
+    Given a type reference (dict with kind/name/ofType), find the corresponding INPUT_OBJECT
+    type definition in 'types' and return a formatted inline object string like:
+      { username: "user", password: "pass" }
+    """
+    if visited is None:
+        visited = set()
+
+    resolved = resolve_type(type_ref)
+    type_name = resolved.get("name")
+    if not type_name:
+        return "{}"
+
+    if type_name in visited:
+        return "{}"
+    visited.add(type_name)
+
+    type_obj = next((t for t in types if t.get("name") == type_name), None)
+    if not type_obj:
+        return "{}"
+
+    input_fields = type_obj.get("inputFields") or []
+    indent = "  " * depth
+    inner_indent = "  " * (depth + 1)
+
+    parts = []
+    for f in input_fields:
+        fname = f["name"]
+        # If defaultValue is provided in introspection, use it
+        if f.get("defaultValue") is not None:
+            val = f["defaultValue"]
+            # defaultValue in introspection is a string representation; leave as-is
+            parts.append(f"{inner_indent}{fname}: {val}")
+            continue
+
+        val = format_input_value(f["type"], types, fname, depth + 1, visited.copy())
+        parts.append(f"{inner_indent}{fname}: {val}")
+
+    if not parts:
+        return "{}"
+
+    if depth == 0:
+        # single-line compact for top-level input
+        inner = ", ".join(p.strip() for p in parts)
+        return "{ " + inner + " }"
+    else:
+        # multi-line with indentation
+        body = "\n".join(parts)
+        return "{\n" + body + f"\n{indent}}}"
+
+def format_input_value(type_ref, types, field_name=None, depth=0, visited=None):
+    """
+    Return a string representing a sample value for the given type reference.
+    Strings are quoted, booleans and numbers are unquoted, lists are bracketed, objects expanded.
+    """
+    t = type_ref
+    # Handle NON_NULL / LIST wrappers
+    if not isinstance(t, dict):
+        return "\"example\""
+
+    if t.get("kind") == "NON_NULL":
+        return format_input_value(t["ofType"], types, field_name, depth, visited)
+    if t.get("kind") == "LIST":
+        # produce a single-element list
+        inner = format_input_value(t["ofType"], types, field_name, depth + 1, visited)
+        return f"[{inner}]"
+
+    # Now resolved scalar/enum/input object/type
+    kind = t.get("kind")
+    name = t.get("name", "")
+
+    # Primitive scalars
+    if kind == "SCALAR" or name in ("String", "ID", ""):
+        # sensible defaults by common field name
+        if field_name:
+            lname = field_name.lower()
+            if "user" in lname and "name" in lname:
+                return f"\"{field_name}_example\""
+            if "name" == lname:
+                return f"\"{field_name}_example\""
+            if "pass" in lname:
+                return "\"password123\""
+            if "email" in lname:
+                return f"\"{field_name}@example.com\""
+            if "msg" in lname or "message" in lname:
+                return f"\"{field_name}_example\""
+            if "role" in lname:
+                return "\"user\""
+        # default string
+        return "\"example\""
+    if name in ("Int", "Float"):
+        return "0"
+    if name == "Boolean":
+        return "false"
+
+    # Enums: try to pick first enum value if present
+    if kind == "ENUM" or (name and any(ti.get("name") == name and ti.get("enumValues") for ti in types)):
+        t_obj = next((ti for ti in types if ti.get("name") == name), None)
+        if t_obj:
+            enum_vals = t_obj.get("enumValues") or []
+            if enum_vals:
+                first = enum_vals[0].get("name")
+                # enums are unquoted or sometimes unquoted values -> return first as bare token
+                return first if first is not None else "\"ENUM_VALUE\""
+        return "\"ENUM_VALUE\""
+
+    # Input objects -> expand recursively
+    if kind == "INPUT_OBJECT" or (name and any(ti.get("name") == name and ti.get("inputFields") for ti in types)):
+        return build_input_object(t, types, depth, visited)
+
+    # Fallback to string
+    return "\"example\""
+
 def generate_full_query(method_field, introspection):
     types = introspection["data"]["__schema"]["types"]
 
     # ---- Extract arguments ----
-    args = method_field.get("args", [])
+    args = method_field.get("args", []) or []
     variables = []
     call_args = []
 
+    # Decide per-arg whether to inline (INPUT_OBJECT) or use variable
     for a in args:
         var_name = a["name"]
-        var_type = stringify_type(a["type"])
-        variables.append(f"${var_name}: {var_type}")
-        call_args.append(f"{var_name}: ${var_name}")
+        resolved = resolve_type(a["type"])
+        kind = resolved.get("kind")
+        name = resolved.get("name")
+
+        if kind == "INPUT_OBJECT" or (name and any(t.get("name") == name and t.get("inputFields") for t in types)):
+            # inline expanded object
+            inline_obj = build_input_object(a["type"], types)
+            call_args.append(f"{var_name}: {inline_obj}")
+        else:
+            # keep as variable
+            var_type = stringify_type(a["type"])
+            variables.append(f"${var_name}: {var_type}")
+            call_args.append(f"{var_name}: ${var_name}")
 
     # Build signature
     variables_str = f"({', '.join(variables)})" if variables else ""
@@ -228,9 +382,12 @@ def generate_full_query(method_field, introspection):
     root_type = method_field["type"]
     fields_tree = build_field_tree(root_type, types, depth=2)
 
+    # Determine operation type (query or mutation)
+    operation = method_field.get("_root", "query")
+
     # ---- Build final query ----
     return f"""
-query {method_field['name']}{variables_str} {{
+{operation} {method_field['name']}{variables_str} {{
   {method_field['name']}{call_args_str} {{
 {fields_tree}
   }}
@@ -273,6 +430,15 @@ def interactive_console(methods, introspection):
             pipe_cmd = None
         # ---------------------
 
+        # Allow shorthand: bare number or exact method name selects the method
+        # but don't override primary commands
+        if not cmd.startswith("use ") and cmd not in ("help", "listMethods", "exit", ""):
+            if cmd.isdigit():
+                cmd = f"use {cmd}"
+            else:
+                if any(m["name"] == cmd for m in methods):
+                    cmd = f"use {cmd}"
+
         # MAIN COMMAND HANDLING
         if cmd == "help":
             output = """Available commands:
@@ -288,7 +454,11 @@ def interactive_console(methods, introspection):
             print(output)
 
         elif cmd == "listMethods":
-            lines = [f" [{i}] {m['name']}" for i, m in enumerate(methods, start=1)]
+            lines = []
+            for i, m in enumerate(methods, start=1):
+                root = m.get("_root", "query")
+                prefix = "Q" if root == "query" else "M"
+                lines.append(f" [{i}] ({prefix}) {m['name']}")
 
             if pipe_cmd:
                 lines = [l for l in lines if grep_text in l.lower()]
@@ -336,6 +506,9 @@ def interactive_console(methods, introspection):
             break
 
         else:
+            if cmd == "":
+                # ignore empty input
+                continue
             print("❌ Unknown command. Type 'help' for the command list.\n")
 
 
