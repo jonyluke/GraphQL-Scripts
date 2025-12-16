@@ -10,6 +10,10 @@ Mejoras:
  - Detecta SQLi incluso cuando se requieren API keys u otros parámetros válidos
  - Reduce falsos positivos agregando confirmación antes de reportar un parámetro
    (reporte solo si hay evidencia de error SQL o múltiples indicios de comportamiento anómalo)
+
+Adición:
+ - Crawl limitado (opt-in) para extraer outputs de consultas y reutilizarlos como inputs
+ - Flags CLI para activar/configurar el crawling
 """
 from __future__ import annotations
 import os
@@ -242,11 +246,18 @@ def truncate_str(s: str, n: int = 180) -> str:
 
 
 def build_query(field_name: str, args_dict: Dict[str, str], selection: Optional[str]) -> Dict[str, Any]:
-    args_str = ", ".join([f'{k}: {json.dumps(v)}' for k, v in args_dict.items()])
-    if selection:
-        q = f'query {{ {field_name}({args_str}) {{ {selection} }} }}'
+    # If no args provided, omit parentheses in GraphQL query
+    if args_dict:
+        args_str = ", ".join([f'{k}: {json.dumps(v)}' for k, v in args_dict.items()])
+        if selection:
+            q = f'query {{ {field_name}({args_str}) {{ {selection} }} }}'
+        else:
+            q = f'query {{ {field_name}({args_str}) }}'
     else:
-        q = f'query {{ {field_name}({args_str}) }}'
+        if selection:
+            q = f'query {{ {field_name} {{ {selection} }} }}'
+        else:
+            q = f'query {{ {field_name} }}'
     return {"query": q}
 
 
@@ -309,6 +320,23 @@ def _build_sqlmap_cmd_marker(repro_marker_path: str) -> str:
     return f"sqlmap --level 5 --risk 3 -r '{repro_marker_path}' -p \"JSON[query]\" --batch --skip-urlencode --parse-errors --random-agent"
 
 
+def get_field_from_response(resp_data: Any, field_name: str) -> Any:
+    """
+    Robustly extract the returned field value from different GraphQL response shapes.
+    resp_data is expected to be the 'data' value returned by post_graphql (i.e., r.json()).
+    """
+    if not resp_data:
+        return None
+    if isinstance(resp_data, dict):
+        # Typical GraphQL: { "data": { "<field>": ... } }
+        if "data" in resp_data and isinstance(resp_data["data"], dict):
+            return resp_data["data"].get(field_name)
+        # Sometimes libraries return the field at top-level
+        if field_name in resp_data:
+            return resp_data.get(field_name)
+    return None
+
+
 def extract_values_from_schema(endpoint: str, headers: Dict[str, str], query_fields: List[Dict[str, Any]], types: List[Dict[str, Any]]) -> Tuple[Dict[str, Set[str]], Dict[str, str]]:
     print(Fore.CYAN + "[*] Extracting potential values from simple queries...")
     extracted_values: Dict[str, Set[str]] = {}
@@ -364,6 +392,166 @@ def extract_values_from_schema(endpoint: str, headers: Dict[str, str], query_fie
         admin_keys = [k for k, r in key_roles.items() if 'admin' in r.lower()]
         if admin_keys:
             print(Fore.GREEN + Style.BRIGHT + f"[+] Found {len(admin_keys)} admin API key(s) in extracted values")
+    return extracted_values, key_roles
+
+
+def crawl_and_extract_values(endpoint: str,
+                             headers: Dict[str, str],
+                             query_fields: List[Dict[str, Any]],
+                             types: List[Dict[str, Any]],
+                             max_depth: int = 2,
+                             max_requests: int = 200,
+                             max_items_per_list: int = 10) -> Tuple[Dict[str, Set[str]], Dict[str, str]]:
+    """
+    Realiza un crawl limitado: ejecuta consultas sin args, luego usa sus outputs como inputs
+    para consultas que requieren args, hasta max_depth niveles. Devuelve:
+      - extracted_values: mapping campo -> set(de strings)
+      - key_roles: mapping valor_clave -> role (cuando se encuentra junto con role)
+    """
+    print(Fore.CYAN + "[*] Crawling schema to extract values for candidate inputs...")
+    extracted_values: Dict[str, Set[str]] = {}
+    key_roles: Dict[str, str] = {}
+    requests_made = 0
+    visited: Set[Tuple[str, str]] = set()  # (field_name, args_hash)
+
+    def collect_strings_from_obj(obj: Any, prefix: Optional[str] = None):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k.startswith("__"):
+                    continue
+                if isinstance(v, str) and v:
+                    extracted_values.setdefault(k, set()).add(v)
+                elif isinstance(v, list) and v:
+                    for item in v[:max_items_per_list]:
+                        if isinstance(item, str):
+                            extracted_values.setdefault(k, set()).add(item)
+                        elif isinstance(item, dict):
+                            collect_strings_from_obj(item, prefix=k)
+                elif isinstance(v, dict):
+                    collect_strings_from_obj(v, prefix=k)
+        elif isinstance(obj, list):
+            for item in obj[:max_items_per_list]:
+                collect_strings_from_obj(item, prefix=prefix)
+
+    # Prepare a map of field_name -> field_def for quick lookup (not strictly necessary but handy)
+    field_map = {f.get("name"): f for f in query_fields if f.get("name") and not f.get("name").startswith("__")}
+
+    # Seed: run all query fields without args (or with trivial args) to collect initial values
+    for field in query_fields:
+        if requests_made >= max_requests:
+            break
+        fname = field.get("name")
+        if not fname or fname.startswith("__"):
+            continue
+        args = field.get("args") or []
+        if args:
+            continue
+        return_type_name = extract_named_type(field.get("type"))
+        ret_def = find_type_definition(types, return_type_name)
+        sel = None
+        if ret_def and ret_def.get("fields"):
+            sel = pick_scalar_field_for_type(ret_def, types) or (ret_def.get("fields")[0].get("name") if ret_def.get("fields") else "__typename")
+        q = build_query(fname, {}, sel)
+        resp = post_graphql(endpoint, headers, q)
+        requests_made += 1
+        rdata = get_field_from_response(resp.get("data"), fname)
+        if rdata:
+            collect_strings_from_obj(rdata)
+            if isinstance(rdata, list):
+                for item in rdata[:max_items_per_list]:
+                    if isinstance(item, dict):
+                        key = item.get("key") or item.get("apiKey") or item.get("token")
+                        role = item.get("role")
+                        if key and role:
+                            key_roles[key] = role
+            elif isinstance(rdata, dict):
+                key = rdata.get("key") or rdata.get("apiKey") or rdata.get("token")
+                role = rdata.get("role")
+                if key and role:
+                    key_roles[key] = role
+
+    # BFS/iterative expansion: try fields that require args, filling args from extracted_values
+    depth = 0
+    while depth < max_depth and requests_made < max_requests:
+        progress = False
+        for field in query_fields:
+            if requests_made >= max_requests:
+                break
+            fname = field.get("name")
+            if not fname or fname.startswith("__"):
+                continue
+            args = field.get("args") or []
+            if not args:
+                continue
+            arg_names = [a.get("name") for a in args if a.get("name")]
+            if not arg_names:
+                continue
+            # Build small candidate lists per arg
+            candidates_per_arg = []
+            for an in arg_names:
+                vals: List[str] = []
+                if an in extracted_values:
+                    vals = list(extracted_values[an])[:3]
+                else:
+                    # try to find related keys by name
+                    for k, vs in extracted_values.items():
+                        kn = re.sub(r'[_\-]', '', k.lower())
+                        an_norm = re.sub(r'[_\-]', '', an.lower())
+                        if an_norm in kn or kn in an_norm:
+                            vals.extend(list(vs)[:2])
+                    if not vals:
+                        vals = ["test", "1", "admin"] if "id" not in an.lower() else ["1", "100"]
+                # dedup & limit
+                vals = list(dict.fromkeys(vals))[:3]
+                candidates_per_arg.append(vals)
+
+            combos = []
+            for prod in product(*candidates_per_arg):
+                args_dict = {arg_names[i]: prod[i] for i in range(len(arg_names))}
+                ahash = hashlib.sha1(json.dumps({"f": fname, "args": args_dict}, sort_keys=True).encode()).hexdigest()
+                if (fname, ahash) in visited:
+                    continue
+                combos.append((args_dict, ahash))
+                if len(combos) >= 6:
+                    break
+
+            for args_dict, ahash in combos:
+                if requests_made >= max_requests:
+                    break
+                visited.add((fname, ahash))
+                sel = None
+                return_type_name = extract_named_type(field.get("type"))
+                ret_def = find_type_definition(types, return_type_name)
+                if ret_def and ret_def.get("fields"):
+                    sel = pick_scalar_field_for_type(ret_def, types) or (ret_def.get("fields")[0].get("name"))
+                q = build_query(fname, args_dict, sel)
+                resp = post_graphql(endpoint, headers, q)
+                requests_made += 1
+                progress = True
+                rdata = get_field_from_response(resp.get("data"), fname)
+                if rdata:
+                    collect_strings_from_obj(rdata)
+                    if isinstance(rdata, list):
+                        for item in rdata[:max_items_per_list]:
+                            if isinstance(item, dict):
+                                key = item.get("key") or item.get("apiKey") or item.get("token")
+                                role = item.get("role")
+                                if key and role:
+                                    key_roles[key] = role
+                    elif isinstance(rdata, dict):
+                        key = rdata.get("key") or rdata.get("apiKey") or rdata.get("token")
+                        role = rdata.get("role")
+                        if key and role:
+                            key_roles[key] = role
+        if not progress:
+            break
+        depth += 1
+
+    total_vals = sum(len(v) for v in extracted_values.values())
+    if total_vals:
+        print(Fore.GREEN + f"[+] Crawled and extracted {total_vals} values from {len(extracted_values)} distinct keys (requests made: {requests_made})")
+    if key_roles:
+        print(Fore.GREEN + f"[+] Found {len(key_roles)} key->role mappings during crawl")
     return extracted_values, key_roles
 
 
@@ -427,7 +615,7 @@ def find_matching_values(arg_name: str, extracted_values: Dict[str, Set[str]], k
     return candidates
 
 
-def run_detector(endpoint: str, headers: Dict[str, str]) -> List[Dict[str, Any]]:
+def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False, crawl_depth: int = 2, max_requests: int = 250, max_items: int = 10) -> List[Dict[str, Any]]:
     """
     Ejecuta el detector y devuelve una lista filtrada de hallazgos.
     - Recolectamos todas las señales en temp_findings por parámetro (field,arg)
@@ -456,7 +644,11 @@ def run_detector(endpoint: str, headers: Dict[str, str]) -> List[Dict[str, Any]]
 
     query_fields = query_type.get("fields", [])
 
-    extracted_values, key_roles = extract_values_from_schema(endpoint, headers, query_fields, types)
+    # Use crawling if requested, otherwise the simpler extractor
+    if crawl:
+        extracted_values, key_roles = crawl_and_extract_values(endpoint, headers, query_fields, types, max_depth=crawl_depth, max_requests=max_requests, max_items_per_list=max_items)
+    else:
+        extracted_values, key_roles = extract_values_from_schema(endpoint, headers, query_fields, types)
 
     # temp storage: (field,arg) -> list of finding dicts
     temp_findings: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
@@ -555,8 +747,7 @@ def run_detector(endpoint: str, headers: Dict[str, str]) -> List[Dict[str, Any]]
             simple_base_norm = normalize_resp(simple_base_resp.get("data"))
             simple_field_value = None
             try:
-                if isinstance(simple_base_resp.get("data"), dict):
-                    simple_field_value = simple_base_resp.get("data", {}).get("data", {}).get(field_name) if simple_base_resp.get("data", {}).get("data") else simple_base_resp.get("data", {}).get(field_name)
+                simple_field_value = get_field_from_response(simple_base_resp.get("data"), field_name)
             except Exception:
                 simple_field_value = None
 
@@ -603,6 +794,7 @@ def run_detector(endpoint: str, headers: Dict[str, str]) -> List[Dict[str, Any]]
                 temp_findings.setdefault(key, [])
 
                 if sql_err:
+                    repro_path = write_repro_request_file_with_marker(endpoint, headers, attack_query, field_name, target_arg_name, payload)
                     temp_findings[key].append({
                         "field": field_name,
                         "arg": target_arg_name,
@@ -612,12 +804,13 @@ def run_detector(endpoint: str, headers: Dict[str, str]) -> List[Dict[str, Any]]
                         "evidence": sql_err["evidence"],
                         "base_response": base_resp.get("data") if base_resp else None,
                         "attack_response": attack_resp.get("data"),
-                        "recommended_cmd": _build_sqlmap_cmd_marker(write_repro_request_file_with_marker(endpoint, headers, attack_query, field_name, target_arg_name, payload)),
-                        "repro": write_repro_request_file_with_marker(endpoint, headers, attack_query, field_name, target_arg_name, payload),
+                        "recommended_cmd": _build_sqlmap_cmd_marker(repro_path),
+                        "repro": repro_path,
                     })
                     continue
 
                 if base_norm and attack_norm and base_norm != attack_norm and not base_has_error:
+                    repro_path = write_repro_request_file_with_marker(endpoint, headers, attack_query, field_name, target_arg_name, payload)
                     temp_findings[key].append({
                         "field": field_name,
                         "arg": target_arg_name,
@@ -627,12 +820,13 @@ def run_detector(endpoint: str, headers: Dict[str, str]) -> List[Dict[str, Any]]
                         "evidence": "Baseline != Attack",
                         "base_response": base_resp.get("data") if base_resp else None,
                         "attack_response": attack_resp.get("data"),
-                        "recommended_cmd": _build_sqlmap_cmd_marker(write_repro_request_file_with_marker(endpoint, headers, attack_query, field_name, target_arg_name, payload)),
-                        "repro": write_repro_request_file_with_marker(endpoint, headers, attack_query, field_name, target_arg_name, payload),
+                        "recommended_cmd": _build_sqlmap_cmd_marker(repro_path),
+                        "repro": repro_path,
                     })
                     continue
 
                 if base_norm and attack_norm and ("null" in attack_norm) and ("null" not in base_norm):
+                    repro_path = write_repro_request_file_with_marker(endpoint, headers, attack_query, field_name, target_arg_name, payload)
                     temp_findings[key].append({
                         "field": field_name,
                         "arg": target_arg_name,
@@ -642,13 +836,14 @@ def run_detector(endpoint: str, headers: Dict[str, str]) -> List[Dict[str, Any]]
                         "evidence": "Null returned on attack while baseline had data",
                         "base_response": base_resp.get("data") if base_resp else None,
                         "attack_response": attack_resp.get("data"),
-                        "recommended_cmd": _build_sqlmap_cmd_marker(write_repro_request_file_with_marker(endpoint, headers, attack_query, field_name, target_arg_name, payload)),
-                        "repro": write_repro_request_file_with_marker(endpoint, headers, attack_query, field_name, target_arg_name, payload),
+                        "recommended_cmd": _build_sqlmap_cmd_marker(repro_path),
+                        "repro": repro_path,
                     })
                     continue
 
                 # simple-response diff (only if simple baseline had meaningful data)
                 if simple_field_value not in (None, {}, []) and simple_base_norm and attack_norm and simple_base_norm != attack_norm:
+                    repro_path = write_repro_request_file_with_marker(endpoint, headers, attack_query, field_name, target_arg_name, payload)
                     temp_findings[key].append({
                         "field": field_name,
                         "arg": target_arg_name,
@@ -658,8 +853,8 @@ def run_detector(endpoint: str, headers: Dict[str, str]) -> List[Dict[str, Any]]
                         "evidence": "Simple baseline __typename differs from attack",
                         "base_response": simple_base_resp.get("data"),
                         "attack_response": attack_resp.get("data"),
-                        "recommended_cmd": _build_sqlmap_cmd_marker(write_repro_request_file_with_marker(endpoint, headers, attack_query, field_name, target_arg_name, payload)),
-                        "repro": write_repro_request_file_with_marker(endpoint, headers, attack_query, field_name, target_arg_name, payload),
+                        "recommended_cmd": _build_sqlmap_cmd_marker(repro_path),
+                        "repro": repro_path,
                     })
                     continue
 
@@ -694,6 +889,7 @@ def run_detector(endpoint: str, headers: Dict[str, str]) -> List[Dict[str, Any]]
                 temp_findings.setdefault(key, [])
 
                 if sa_err:
+                    repro_path = write_repro_request_file_with_marker(endpoint, headers, simple_attack_q["query"], field_name, target_arg_name, payload)
                     temp_findings[key].append({
                         "field": field_name,
                         "arg": target_arg_name,
@@ -703,12 +899,13 @@ def run_detector(endpoint: str, headers: Dict[str, str]) -> List[Dict[str, Any]]
                         "evidence": sa_err["evidence"],
                         "base_response": simple_base_resp.get("data"),
                         "attack_response": simple_atk_resp.get("data"),
-                        "recommended_cmd": _build_sqlmap_cmd_marker(write_repro_request_file_with_marker(endpoint, headers, simple_attack_q["query"], field_name, target_arg_name, payload)),
-                        "repro": write_repro_request_file_with_marker(endpoint, headers, simple_attack_q["query"], field_name, target_arg_name, payload),
+                        "recommended_cmd": _build_sqlmap_cmd_marker(repro_path),
+                        "repro": repro_path,
                     })
                     break
 
                 if simple_field_value not in (None, {}, []) and simple_base_norm and sa_norm and simple_base_norm != sa_norm:
+                    repro_path = write_repro_request_file_with_marker(endpoint, headers, simple_attack_q["query"], field_name, target_arg_name, payload)
                     temp_findings[key].append({
                         "field": field_name,
                         "arg": target_arg_name,
@@ -718,8 +915,8 @@ def run_detector(endpoint: str, headers: Dict[str, str]) -> List[Dict[str, Any]]
                         "evidence": "Simple baseline __typename differs from attack",
                         "base_response": simple_base_resp.get("data"),
                         "attack_response": simple_atk_resp.get("data"),
-                        "recommended_cmd": _build_sqlmap_cmd_marker(write_repro_request_file_with_marker(endpoint, headers, simple_attack_q["query"], field_name, target_arg_name, payload)),
-                        "repro": write_repro_request_file_with_marker(endpoint, headers, simple_attack_q["query"], field_name, target_arg_name, payload),
+                        "recommended_cmd": _build_sqlmap_cmd_marker(repro_path),
+                        "repro": repro_path,
                     })
                     break
 
@@ -814,10 +1011,14 @@ def main():
     parser = argparse.ArgumentParser(description="GraphQL SQLi mini-detector (Enhanced - extracts values from schema)")
     parser.add_argument("endpoint", help="GraphQL endpoint URL")
     parser.add_argument("headers", nargs="?", help="Optional headers JSON", default=None)
+    parser.add_argument("--crawl", action="store_true", help="Enable limited crawling to extract outputs and reuse them as inputs (opt-in, may increase requests)")
+    parser.add_argument("--crawl-depth", type=int, default=2, help="Max crawl depth (default: 2)")
+    parser.add_argument("--max-requests", type=int, default=250, help="Maximum number of requests allowed during crawling (default: 250)")
+    parser.add_argument("--max-items", type=int, default=10, help="Max items per list to inspect when extracting values (default: 10)")
     args = parser.parse_args()
 
     headers = try_parse_headers(args.headers)
-    findings = run_detector(args.endpoint, headers)
+    findings = run_detector(args.endpoint, headers, crawl=args.crawl, crawl_depth=args.crawl_depth, max_requests=args.max_requests, max_items=args.max_items)
     print_findings_short(findings, TRUNCATE_LEN_DEFAULT)
 
 
