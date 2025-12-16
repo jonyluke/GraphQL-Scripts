@@ -144,4 +144,3 @@ Signals checked:
   - custom payload lists and strategies
 - Expand payloads to include boolean- and time-based techniques (blind SQLi).
 - Add more robust heuristics (email/UUID/hash detection, fuzzy matches).
-- 
