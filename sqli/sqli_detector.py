@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-"""
-sqli_detector.py
-GraphQL SQL injection mini-detector (Python) - General crawler + extractor.
-
-Change in this revision:
-- Prioritizes admin API keys when populating arguments that look like keys (e.g. apiKey, key, token).
-  If the crawler has discovered keys with role='admin', those keys are tried first for arguments
-  that appear to accept API keys. This increases the chance of triggering privileged code paths
-  that may expose SQLi behavior.
-
-Note: Crawling remains opt-in via --crawl. Use with authorization and care.
-"""
 from __future__ import annotations
 import re
 import json
@@ -18,6 +6,7 @@ import base64
 import hashlib
 import argparse
 import time
+import shutil
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
@@ -103,8 +92,11 @@ SQL_ERROR_SIGS = [
 
 TIMEOUT = 20
 REPRO_DIR = "repro-payloads"
+INDEX_FILE = "index.json"
 TRUNCATE_LEN_DEFAULT = 120
+EVIDENCE_MAX_CHARS = 80  # max chars to display for evidence in console
 
+# -------------------- Utilities -------------------------------------------
 
 def try_parse_headers(h: Optional[str]) -> Dict[str, str]:
     if not h:
@@ -131,13 +123,12 @@ def try_parse_headers(h: Optional[str]) -> Dict[str, str]:
             headers[k.strip()] = v.strip()
     return headers
 
-
 def post_graphql(endpoint: str, headers: Dict[str, str], payload: Dict[str, Any], verbose: bool = False) -> Dict[str, Any]:
     h = {"Content-Type": "application/json"}
     h.update(headers or {})
     if verbose:
         q = payload.get("query") if isinstance(payload, dict) else str(payload)
-        print(Fore.BLUE + Style.DIM + "[>] POST " + endpoint + " BODY: " + Style.RESET_ALL + truncate_str(q, 800))
+        print(Fore.BLUE + Style.DIM + "[>] POST " + endpoint + " BODY: " + Style.RESET_ALL + (q[:800] + "..." if len(q) > 800 else q))
     try:
         r = requests.post(endpoint, json=payload, headers=h, timeout=TIMEOUT)
         try:
@@ -148,27 +139,28 @@ def post_graphql(endpoint: str, headers: Dict[str, str], payload: Dict[str, Any]
     except requests.RequestException as e:
         return {"status": 0, "data": {"errors": [{"message": str(e)}]}}
 
-
 def extract_named_type(t: Optional[Dict[str, Any]]) -> Optional[str]:
-    if not t: return None
-    if t.get("name"): return t.get("name")
-    if t.get("ofType"): return extract_named_type(t.get("ofType"))
+    if not t:
+        return None
+    if t.get("name"):
+        return t.get("name")
+    if t.get("ofType"):
+        return extract_named_type(t.get("ofType"))
     return None
 
-
 def is_string_type(arg_type_name: Optional[str]) -> bool:
-    if not arg_type_name: return False
+    if not arg_type_name:
+        return False
     n = arg_type_name.lower()
     return n in ("string", "id", "varchar", "text")
 
-
 def find_type_definition(schema_types: List[Dict[str, Any]], name: Optional[str]) -> Optional[Dict[str, Any]]:
-    if not name: return None
+    if not name:
+        return None
     for t in schema_types:
         if t.get("name") == name:
             return t
     return None
-
 
 def pick_scalar_field_for_type(type_def: Optional[Dict[str, Any]], schema_types: List[Dict[str, Any]]) -> Optional[str]:
     if not type_def or not type_def.get("fields"):
@@ -185,13 +177,11 @@ def pick_scalar_field_for_type(type_def: Optional[Dict[str, Any]], schema_types:
             return f.get("name")
     return None
 
-
 def normalize_resp(data: Any) -> str:
     try:
         return json.dumps(data, sort_keys=True, ensure_ascii=False)
     except Exception:
         return str(data)
-
 
 def truncate_str(s: str, n: int = 180) -> str:
     if s is None:
@@ -199,6 +189,14 @@ def truncate_str(s: str, n: int = 180) -> str:
     s = str(s)
     return s if len(s) <= n else s[:n] + "..."
 
+def first_evidence_line(evidence: str, max_len: int = 200) -> str:
+    if not evidence:
+        return ""
+    for ln in evidence.splitlines():
+        ln = ln.strip()
+        if ln:
+            return truncate_str(ln, max_len)
+    return truncate_str(evidence, max_len)
 
 def build_query(field_name: str, args_dict: Dict[str, str], selection: Optional[str]) -> Dict[str, Any]:
     if args_dict:
@@ -214,10 +212,8 @@ def build_query(field_name: str, args_dict: Dict[str, str], selection: Optional[
             q = f'query {{ {field_name} }}'
     return {"query": q}
 
-
 def _sanitize_name(s: str) -> str:
     return re.sub(r"[^\w\-]+", "_", s)[:64]
-
 
 def _write_raw_http(endpoint: str, headers: Dict[str, str], body_json: Dict[str, Any], fname: str) -> str:
     repo_root = Path.cwd()
@@ -250,74 +246,23 @@ def _write_raw_http(endpoint: str, headers: Dict[str, str], body_json: Dict[str,
         fh.write(content)
     return str(fpath)
 
-
-def write_repro_request_file_with_marker(endpoint: str, headers: Dict[str, str], attack_query: str, field: str, arg: str, payload: str) -> str:
+def _read_index() -> Dict[str, Any]:
+    idx_path = Path(REPRO_DIR) / INDEX_FILE
+    if not idx_path.exists():
+        return {}
     try:
-        escaped_payload = json.dumps(payload)
+        with open(idx_path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
     except Exception:
-        escaped_payload = payload
-    escaped_marker = json.dumps("*")
-    if escaped_payload in attack_query:
-        marker_query = attack_query.replace(escaped_payload, escaped_marker, 1)
-    elif payload in attack_query:
-        marker_query = attack_query.replace(payload, "*", 1)
-    else:
-        marker_query = attack_query.replace("\\" + payload, escaped_marker, 1)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    short_hash = hashlib.sha1(marker_query.encode("utf-8")).hexdigest()[:8]
-    fname = f"{_sanitize_name(field)}_{_sanitize_name(arg)}_{ts}_{short_hash}_marker.http"
-    body = {"query": marker_query}
-    return _write_raw_http(endpoint, headers, body, fname)
+        return {}
 
+def _write_index(idx: Dict[str, Any]) -> None:
+    idx_path = Path(REPRO_DIR)
+    idx_path.mkdir(parents=True, exist_ok=True)
+    with open(idx_path / INDEX_FILE, "w", encoding="utf-8") as fh:
+        json.dump(idx, fh, ensure_ascii=False, indent=2)
 
-def _build_sqlmap_cmd_marker(repro_marker_path: str) -> str:
-    return f"sqlmap --level 5 --risk 3 -r '{repro_marker_path}' -p \"JSON[query]\" --batch --skip-urlencode --random-agent"
-
-
-def get_field_from_response(resp_data: Any, field_name: str) -> Any:
-    if not resp_data:
-        return None
-    if isinstance(resp_data, dict):
-        if "data" in resp_data and isinstance(resp_data["data"], dict):
-            return resp_data["data"].get(field_name)
-        if field_name in resp_data:
-            return resp_data.get(field_name)
-    return None
-
-
-def _pretty_print_extracted_values(extracted_values: Dict[str, Set[str]], key_roles: Dict[str, str], max_per_key: int = 6):
-    if not extracted_values and not key_roles:
-        print(Fore.YELLOW + "[*] No extracted values found.")
-        return
-    print(Fore.CYAN + "[*] Extracted values (sample):")
-    if key_roles:
-        print(Fore.MAGENTA + "  Key -> role mappings:")
-        for k, r in list(key_roles.items())[:10]:
-            print(Fore.MAGENTA + f"    {k} -> {r}")
-    if extracted_values:
-        print(Fore.CYAN + "  Field -> values:")
-        for key in sorted(extracted_values.keys()):
-            vals = list(extracted_values[key])
-            sample = vals[:max_per_key]
-            print(Fore.CYAN + f"    {key}: " + Fore.WHITE + f"{json.dumps(sample, ensure_ascii=False)}" + Style.RESET_ALL)
-
-
-def try_decode_global_id(val: str) -> Optional[Tuple[str, str]]:
-    if not isinstance(val, str):
-        return None
-    if len(val) < 8:
-        return None
-    if not re.fullmatch(r'[A-Za-z0-9+/=]+', val):
-        return None
-    try:
-        decoded = base64.b64decode(val + '===').decode('utf-8', errors='ignore')
-    except Exception:
-        return None
-    if ':' in decoded:
-        parts = decoded.split(':', 1)
-        return parts[0].strip(), parts[1].strip()
-    return None
-
+# -------------------- Crawling / extraction --------------------------------
 
 def seed_field_queries(field: Dict[str, Any], types: List[Dict[str, Any]], page_sizes: List[int], max_items: int) -> List[str]:
     fname = field.get("name")
@@ -340,6 +285,70 @@ def seed_field_queries(field: Dict[str, Any], types: List[Dict[str, Any]], page_
         queries.append(f'query {{ {fname}(first: {n}) {{ {selection} }} }}')
     return queries
 
+def get_field_from_response(resp_data: Any, field_name: str) -> Any:
+    if not resp_data:
+        return None
+    if isinstance(resp_data, dict):
+        if "data" in resp_data and isinstance(resp_data["data"], dict):
+            return resp_data["data"].get(field_name)
+        if field_name in resp_data:
+            return resp_data.get(field_name)
+    return None
+
+def _pretty_print_extracted_values(extracted_values: Dict[str, Set[str]], key_roles: Dict[str, str], max_per_key: int = 6):
+    if not extracted_values and not key_roles:
+        print(Fore.YELLOW + "[*] No extracted values found.")
+        return
+    print(Fore.CYAN + "[*] Extracted values (sample):")
+    if key_roles:
+        print(Fore.MAGENTA + "  Key -> role mappings:")
+        for k, r in list(key_roles.items())[:10]:
+            print(Fore.MAGENTA + f"    {k} -> {r}")
+    if extracted_values:
+        print(Fore.CYAN + "  Field -> values:")
+        for key in sorted(extracted_values.keys()):
+            vals = list(extracted_values[key])
+            sample = vals[:max_per_key]
+            print(Fore.CYAN + f"    {key}: " + Fore.WHITE + f"{json.dumps(sample, ensure_ascii=False)}" + Style.RESET_ALL)
+
+def try_decode_global_id(val: str) -> Optional[Tuple[str, str]]:
+    if not isinstance(val, str):
+        return None
+    if len(val) < 8:
+        return None
+    if not re.fullmatch(r'[A-Za-z0-9+/=]+', val):
+        return None
+    try:
+        decoded = base64.b64decode(val + '===').decode('utf-8', errors='ignore')
+    except Exception:
+        return None
+    if ':' in decoded:
+        parts = decoded.split(':', 1)
+        return parts[0].strip(), parts[1].strip()
+    return None
+
+def simple_name_match_values(arg_name: str, extracted_values: Dict[str, Set[str]]) -> List[str]:
+    an = (arg_name or "").lower()
+    if an in extracted_values:
+        return list(extracted_values[an])[:5]
+    candidates = []
+    for k, vals in extracted_values.items():
+        kn = k.lower()
+        if an in kn or kn in an:
+            candidates.extend(list(vals)[:3])
+    if 'key' in an and 'key' in extracted_values:
+        candidates = list(extracted_values['key'])[:5] + candidates
+    if 'token' in an and 'token' in extracted_values:
+        candidates = list(extracted_values['token'])[:5] + candidates
+    seen = set()
+    res = []
+    for v in candidates:
+        if v not in seen:
+            res.append(v)
+            seen.add(v)
+        if len(res) >= 5:
+            break
+    return res
 
 def crawl_and_extract_values(endpoint: str,
                              headers: Dict[str, str],
@@ -350,6 +359,10 @@ def crawl_and_extract_values(endpoint: str,
                              max_items_per_list: int = 10,
                              delay: float = 0.0,
                              verbose: bool = False) -> Tuple[Dict[str, Set[str]], Dict[str, str]]:
+    """
+    Crawl simple query fields to extract string values to reuse as candidates for arguments.
+    Returns (extracted_values, key_roles).
+    """
     print(Fore.CYAN + "[*] Crawling schema to extract values for candidate inputs...")
     extracted_values: Dict[str, Set[str]] = {}
     key_roles: Dict[str, str] = {}
@@ -413,6 +426,7 @@ def crawl_and_extract_values(endpoint: str,
             if delay and requests_made < max_requests:
                 time.sleep(delay)
 
+    # decode base64/global IDs to numeric ids
     added_decoded = 0
     for key, vals in list(extracted_values.items()):
         for v in list(vals)[:200]:
@@ -425,6 +439,7 @@ def crawl_and_extract_values(endpoint: str,
     if added_decoded:
         print(Fore.GREEN + f"[+] Decoded {added_decoded} global/base64 id(s)")
 
+    # follow-up BFS using id-like args
     depth = 0
     while depth < max_depth and requests_made < max_requests:
         progress = False
@@ -526,30 +541,195 @@ def crawl_and_extract_values(endpoint: str,
     _pretty_print_extracted_values(extracted_values, key_roles)
     return extracted_values, key_roles
 
+# -------------------- Grouping & printing (left-aligned compact) -----------
 
-def simple_name_match_values(arg_name: str, extracted_values: Dict[str, Set[str]]) -> List[str]:
-    an = arg_name.lower()
-    if an in extracted_values:
-        return list(extracted_values[an])[:5]
-    candidates = []
-    for k, vals in extracted_values.items():
-        kn = k.lower()
-        if an in kn or kn in an:
-            candidates.extend(list(vals)[:3])
-    if 'key' in an and 'key' in extracted_values:
-        candidates = list(extracted_values['key'])[:5] + candidates
-    if 'token' in an and 'token' in extracted_values:
-        candidates = list(extracted_values['token'])[:5] + candidates
-    seen = set()
-    res = []
-    for v in candidates:
-        if v not in seen:
-            res.append(v)
-            seen.add(v)
-        if len(res) >= 5:
-            break
-    return res
+def compute_confidence(evidence_type: str, payload: str, has_repro: bool) -> float:
+    weights = {
+        "SQL_ERROR": 0.6,
+        "SQL_ERROR_IN_RESPONSE": 0.6,
+        "SQL_ERROR_IN_RESPONSE_SIMPLE": 0.6,
+        "RESPONSE_DIFF": 0.2,
+        "RESPONSE_DIFF_SIMPLE": 0.1,
+        "NULL_ON_ATTACK": 0.15,
+    }
+    base = weights.get(evidence_type, 0.1)
+    payload_bonus = 0.0
+    if payload and re.search(r"(\bOR\b|\bUNION\b|--|/\*|')", payload, re.I):
+        payload_bonus = 0.1
+    repro_bonus = 0.15 if has_repro else 0.0
+    score = base + payload_bonus + repro_bonus
+    if score > 0.99:
+        score = 0.99
+    return round(score, 2)
 
+def group_findings_by_param(findings: List[Dict[str, Any]], endpoint: str) -> Dict[str, Any]:
+    grouped: Dict[str, Any] = {}
+    for f in findings:
+        param = f.get("arg") or "unknown"
+        field = f.get("field") or ""
+        args_context = dict(f.get("args_used") or {})
+        args_context.pop(param, None)
+        payload = f.get("payload")
+        evidence_type = f.get("type") or ""
+        evidence_text = f.get("evidence") or ""
+        repro = f.get("repro") or ""
+        recommended_cmd = f.get("recommended_cmd") or (_build_sqlmap_cmd_marker(repro) if repro else "")
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        confidence = compute_confidence(evidence_type, payload or "", bool(repro))
+        occ_list = grouped.setdefault(param, {"occurrences": {}, "aggregate": {}})
+        occ_key = f"{field} @ {endpoint}"
+        occ = occ_list["occurrences"].setdefault(occ_key, {"field": field, "endpoint": endpoint, "args_context": args_context, "findings": []})
+        occ["findings"].append({
+            "payload": payload,
+            "evidence_type": evidence_type,
+            "evidence": evidence_text,
+            "attack_response": truncate_str(str(f.get("attack_response")), 1000),
+            "base_response": truncate_str(str(f.get("base_response")), 1000),
+            "repro": repro,
+            "recommended_cmd": recommended_cmd,
+            "timestamp": timestamp,
+            "confidence": confidence,
+            "args_used": f.get("args_used")
+        })
+    for param, data in list(grouped.items()):
+        occs = []
+        all_payloads = set()
+        max_conf = 0.0
+        for k, v in data["occurrences"].items():
+            occs.append(v)
+            for fin in v.get("findings", []):
+                all_payloads.add(fin.get("payload"))
+                if fin.get("confidence", 0) > max_conf:
+                    max_conf = fin.get("confidence", 0)
+        severity = "high" if max_conf >= 0.9 else "low"
+        data["occurrences"] = occs
+        data["aggregate"] = {
+            "unique_payloads": len(all_payloads),
+            "total_evidences": sum(len(o.get("findings", [])) for o in occs),
+            "max_confidence": max_conf,
+            "fields_affected": len(occs),
+            "severity": severity,
+            "notes": ""
+        }
+    return grouped
+
+def print_grouped_summary(grouped: Dict[str, Any]):
+    """
+    Left-aligned compact printing:
+     - header: [n] <param>  (param in red; no occurrence line)
+     - Slight indentation for Payload / Evidence lines.
+     - Payload label in yellow, Evidence label in blue.
+     - Recommended sqlmap command label in magenta, printed with NO extra indentation.
+    """
+    if not grouped:
+        return
+
+    params = sorted(grouped.items(), key=lambda kv: (0 if kv[1].get("aggregate", {}).get("severity") == "high" else 1, kv[0]))
+    print(Fore.MAGENTA + "\n[*] Findings grouped by vulnerable parameter:\n")
+
+    for idx, (param, data) in enumerate(params, start=1):
+        # header left aligned, param in red
+        print(f"[{idx}] {Fore.RED}{param}{Style.RESET_ALL}")
+
+        for occ in data.get("occurrences", []):
+            # omit printing "<field> @ <endpoint> (context args: ...)"
+
+            for fin in occ.get("findings", []):
+                payload = fin.get("payload")
+                payload_display = payload if payload is not None else json.dumps(fin.get("args_used") or {}, ensure_ascii=False)
+                # slight indent for payload/evidence
+                print("  " + Fore.YELLOW + "Payload: " + Style.RESET_ALL + f"{payload_display}")
+
+                evidence = fin.get("evidence") or ""
+                cleaned = re.sub(r"\s+", " ", evidence).strip()
+                cleaned = re.sub(r"\[SQL: .*", "[SQL TRACE]", cleaned, flags=re.S)
+                if len(cleaned) > EVIDENCE_MAX_CHARS:
+                    cleaned = cleaned[:EVIDENCE_MAX_CHARS - 3].rstrip() + "..."
+                    if re.search(r"\[SQL TRACE\]", evidence, flags=re.I) and "[SQL TRACE]" not in cleaned:
+                        cleaned = cleaned + " [SQL TRACE]"
+                print("  " + Fore.BLUE + "Evidence: " + Style.RESET_ALL + cleaned)
+                print("")  # blank line between findings
+
+            # Recommended sqlmap command label in magenta, no indentation
+            first_repro = None
+            first_cmd = None
+            for fin in occ.get("findings", []):
+                if fin.get("repro"):
+                    first_repro = fin.get("repro")
+                    first_cmd = fin.get("recommended_cmd") or _build_sqlmap_cmd_marker(first_repro)
+                    break
+            if first_repro:
+                print(Fore.MAGENTA + "Recommended sqlmap command:" + Style.RESET_ALL)
+                print(Fore.MAGENTA + f"{first_cmd}" + Style.RESET_ALL)
+            print("")  # blank line between occurrences
+
+# -------------------- Detection flow (markers, checks) ---------------------
+
+def _canonical_marker_key(endpoint: str, field: str, arg: str, context_args: Dict[str, Any]) -> str:
+    parts = [endpoint, field, arg]
+    arg_names = sorted(list(context_args.keys())) if isinstance(context_args, dict) else []
+    parts.append(",".join(arg_names))
+    return "|".join(parts)
+
+def write_or_update_marker(endpoint: str, headers: Dict[str, str], attack_query: str,
+                           field: str, arg: str, payload: str,
+                           context_args: Dict[str, Any],
+                           evidence_type: Optional[str], evidence_text: Optional[str]) -> str:
+    try:
+        escaped_payload = json.dumps(payload)
+    except Exception:
+        escaped_payload = payload
+    escaped_marker = json.dumps("*")
+    if escaped_payload in attack_query:
+        marker_query = attack_query.replace(escaped_payload, escaped_marker, 1)
+    elif payload in attack_query:
+        marker_query = attack_query.replace(payload, "*", 1)
+    else:
+        marker_query = attack_query.replace("\\" + payload, escaped_marker, 1)
+
+    canonical = _canonical_marker_key(endpoint, field, arg, context_args or {})
+    short_hash = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:8]
+    filename = f"{_sanitize_name(field)}_{_sanitize_name(arg)}_{short_hash}_marker.http"
+
+    repro_dir = Path(REPRO_DIR)
+    repro_dir.mkdir(parents=True, exist_ok=True)
+    marker_path = repro_dir / filename
+
+    if not marker_path.exists():
+        body = {"query": marker_query}
+        _write_raw_http(endpoint, headers, body, filename)
+
+    idx = _read_index()
+    entry = idx.get(filename) or {
+        "endpoint": endpoint,
+        "field": field,
+        "arg": arg,
+        "context_arg_names": sorted(list((context_args or {}).keys())),
+        "evidences": []
+    }
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    repro_rel = str(marker_path)
+    recommended_cmd = f"sqlmap --level 5 --risk 3 -r '{repro_rel}' -p \"JSON[query]\" --batch --skip-urlencode --random-agent"
+
+    evidence_record = {
+        "payload": payload,
+        "evidence_type": evidence_type or "",
+        "evidence": evidence_text or "",
+        "timestamp": ts,
+        "repro": repro_rel,
+        "recommended_cmd": recommended_cmd
+    }
+
+    exists = any(e.get("payload") == payload and e.get("evidence") == evidence_text for e in entry.get("evidences", []))
+    if not exists:
+        entry.setdefault("evidences", []).append(evidence_record)
+    idx[filename] = entry
+    _write_index(idx)
+    return str(marker_path)
+
+def _build_sqlmap_cmd_marker(repro_marker_path: str) -> str:
+    return f"sqlmap --level 5 --risk 3 -r '{repro_marker_path}' -p \"JSON[query]\" --batch --skip-urlencode --parse-errors --random-agent"
 
 def check_sql_error_in_response(resp_data: Dict[str, Any]) -> Optional[Dict[str, str]]:
     if not resp_data:
@@ -564,7 +744,6 @@ def check_sql_error_in_response(resp_data: Dict[str, Any]) -> Optional[Dict[str,
                 return {"evidence": msg, "pattern": rx.pattern}
     return None
 
-
 def detect_missing_required_arg(resp_data: Dict[str, Any]) -> Optional[str]:
     if not resp_data:
         return None
@@ -576,7 +755,6 @@ def detect_missing_required_arg(resp_data: Dict[str, Any]) -> Optional[str]:
             return m.group(1)
     return None
 
-
 def detect_graphql_syntax_error(resp_data: Dict[str, Any]) -> Optional[str]:
     if not resp_data:
         return None
@@ -587,14 +765,31 @@ def detect_graphql_syntax_error(resp_data: Dict[str, Any]) -> Optional[str]:
             return msg
     return None
 
+def compute_confidence(evidence_type: str, payload: str, has_repro: bool) -> float:
+    weights = {
+        "SQL_ERROR": 0.6,
+        "SQL_ERROR_IN_RESPONSE": 0.6,
+        "SQL_ERROR_IN_RESPONSE_SIMPLE": 0.6,
+        "RESPONSE_DIFF": 0.2,
+        "RESPONSE_DIFF_SIMPLE": 0.1,
+        "NULL_ON_ATTACK": 0.15,
+    }
+    base = weights.get(evidence_type, 0.1)
+    payload_bonus = 0.0
+    if payload and re.search(r"(\bOR\b|\bUNION\b|--|/\*|')", payload, re.I):
+        payload_bonus = 0.1
+    repro_bonus = 0.15 if has_repro else 0.0
+    score = base + payload_bonus + repro_bonus
+    if score > 0.99:
+        score = 0.99
+    return round(score, 2)
 
-def write_marker_and_cmd(endpoint: str, headers: Dict[str, str], attack_query: str, field: str, arg: str, payload: str) -> Tuple[str, str]:
-    repro = write_repro_request_file_with_marker(endpoint, headers, attack_query, field, arg, payload)
-    cmd = _build_sqlmap_cmd_marker(repro)
-    return repro, cmd
+# -------------------- Main detection logic --------------------------------
 
+def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False,
+                 crawl_depth: int = 2, max_requests: int = 250, max_items: int = 10,
+                 crawl_delay: float = 0.0, verbose: bool = False) -> List[Dict[str, Any]]:
 
-def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False, crawl_depth: int = 2, max_requests: int = 250, max_items: int = 10, crawl_delay: float = 0.0, verbose: bool = False) -> List[Dict[str, Any]]:
     print(Fore.CYAN + f"[*] Running introspection on {endpoint}")
     intros = post_graphql(endpoint, headers, {"query": INTROSPECTION_QUERY}, verbose=verbose)
     schema = None
@@ -614,11 +809,15 @@ def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False, cr
     query_fields = query_type.get("fields", [])
 
     if crawl:
-        extracted_values, key_roles = crawl_and_extract_values(endpoint, headers, query_fields, types, max_depth=crawl_depth, max_requests=max_requests, max_items_per_list=max_items, delay=crawl_delay, verbose=verbose)
+        extracted_values, key_roles = crawl_and_extract_values(
+            endpoint, headers, query_fields, types,
+            max_depth=crawl_depth, max_requests=max_requests,
+            max_items_per_list=max_items, delay=crawl_delay, verbose=verbose)
     else:
-        extracted_values, key_roles = crawl_and_extract_values(endpoint, headers, query_fields, types, max_depth=1, max_requests=50, max_items_per_list=max_items, delay=crawl_delay, verbose=verbose)
+        extracted_values, key_roles = crawl_and_extract_values(
+            endpoint, headers, query_fields, types,
+            max_depth=1, max_requests=50, max_items_per_list=max_items, delay=crawl_delay, verbose=verbose)
 
-    # build a list of admin keys (if any) to prioritize for key-like args
     admin_keys = [k for k, r in key_roles.items() if isinstance(r, str) and 'admin' in r.lower()]
     if admin_keys:
         print(Fore.GREEN + f"[+] Prioritizing {len(admin_keys)} admin key(s) when filling key-like arguments")
@@ -655,9 +854,7 @@ def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False, cr
         for arg in args:
             an = arg.get("name")
             ev = list(extracted_values.get(an, []))[:8]
-            # If there are admin keys and this arg looks like a key, prioritize admin keys
             if an and any(k in an.lower() for k in ("key", "apikey", "token")) and admin_keys:
-                # put admin keys first (dedup while preserving order)
                 deduped = []
                 for k in admin_keys:
                     if k not in deduped:
@@ -762,23 +959,31 @@ def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False, cr
                 temp_findings.setdefault(key, [])
 
                 if sql_err:
-                    repro, cmd = write_marker_and_cmd(endpoint, headers, attack_q_str, field_name, target_arg_name, payload)
+                    marker_path = write_or_update_marker(
+                        endpoint, headers, attack_q_str, field_name, target_arg_name, payload,
+                        {k: v for k, v in attack_args.items() if k != target_arg_name},
+                        "SQL_ERROR", sql_err.get("evidence"))
+                    cmd = _build_sqlmap_cmd_marker(marker_path)
                     temp_findings[key].append({
                         "field": field_name,
                         "arg": target_arg_name,
                         "payload": payload,
                         "args_used": attack_args.copy(),
-                        "type": "SQL_ERROR_IN_RESPONSE",
+                        "type": "SQL_ERROR",
                         "evidence": sql_err["evidence"],
                         "base_response": base_resp.get("data") if base_resp else None,
                         "attack_response": attack_resp.get("data"),
                         "recommended_cmd": cmd,
-                        "repro": repro,
+                        "repro": marker_path,
                     })
                     continue
 
                 if base_norm and attack_norm and base_norm != attack_norm and not base_has_error:
-                    repro, cmd = write_marker_and_cmd(endpoint, headers, attack_q_str, field_name, target_arg_name, payload)
+                    marker_path = write_or_update_marker(
+                        endpoint, headers, attack_q_str, field_name, target_arg_name, payload,
+                        {k: v for k, v in attack_args.items() if k != target_arg_name},
+                        "RESPONSE_DIFF", "Baseline != Attack")
+                    cmd = _build_sqlmap_cmd_marker(marker_path)
                     temp_findings[key].append({
                         "field": field_name,
                         "arg": target_arg_name,
@@ -789,12 +994,16 @@ def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False, cr
                         "base_response": base_resp.get("data") if base_resp else None,
                         "attack_response": attack_resp.get("data"),
                         "recommended_cmd": cmd,
-                        "repro": repro,
+                        "repro": marker_path,
                     })
                     continue
 
                 if base_norm and attack_norm and ("null" in attack_norm) and ("null" not in base_norm):
-                    repro, cmd = write_marker_and_cmd(endpoint, headers, attack_q_str, field_name, target_arg_name, payload)
+                    marker_path = write_or_update_marker(
+                        endpoint, headers, attack_q_str, field_name, target_arg_name, payload,
+                        {k: v for k, v in attack_args.items() if k != target_arg_name},
+                        "NULL_ON_ATTACK", "Null returned on attack while baseline had data")
+                    cmd = _build_sqlmap_cmd_marker(marker_path)
                     temp_findings[key].append({
                         "field": field_name,
                         "arg": target_arg_name,
@@ -805,12 +1014,16 @@ def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False, cr
                         "base_response": base_resp.get("data") if base_resp else None,
                         "attack_response": attack_resp.get("data"),
                         "recommended_cmd": cmd,
-                        "repro": repro,
+                        "repro": marker_path,
                     })
                     continue
 
                 if simple_field_value not in (None, {}, []) and simple_base_norm and attack_norm and simple_base_norm != attack_norm:
-                    repro, cmd = write_marker_and_cmd(endpoint, headers, attack_q_str, field_name, target_arg_name, payload)
+                    marker_path = write_or_update_marker(
+                        endpoint, headers, attack_q_str, field_name, target_arg_name, payload,
+                        {k: v for k, v in attack_args.items() if k != target_arg_name},
+                        "RESPONSE_DIFF_SIMPLE", "Simple baseline __typename differs from attack")
+                    cmd = _build_sqlmap_cmd_marker(marker_path)
                     temp_findings[key].append({
                         "field": field_name,
                         "arg": target_arg_name,
@@ -821,10 +1034,11 @@ def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False, cr
                         "base_response": simple_base_resp.get("data"),
                         "attack_response": attack_resp.get("data"),
                         "recommended_cmd": cmd,
-                        "repro": repro,
+                        "repro": marker_path,
                     })
                     continue
 
+            # fallback simple checks
             for payload in PAYLOADS:
                 simple_attack_q = build_query(field_name, {target_arg_name: payload}, "__typename")
                 simple_q_str = simple_attack_q.get("query") if isinstance(simple_attack_q, dict) else str(simple_attack_q)
@@ -856,7 +1070,9 @@ def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False, cr
                 temp_findings.setdefault(key, [])
 
                 if sa_err:
-                    repro, cmd = write_marker_and_cmd(endpoint, headers, simple_q_str, field_name, target_arg_name, payload)
+                    marker_path = write_or_update_marker(
+                        endpoint, headers, simple_q_str, field_name, target_arg_name, payload, {}, "SQL_ERROR", sa_err.get("evidence"))
+                    cmd = _build_sqlmap_cmd_marker(marker_path)
                     temp_findings[key].append({
                         "field": field_name,
                         "arg": target_arg_name,
@@ -867,12 +1083,14 @@ def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False, cr
                         "base_response": simple_base_resp.get("data"),
                         "attack_response": simple_atk_resp.get("data"),
                         "recommended_cmd": cmd,
-                        "repro": repro,
+                        "repro": marker_path,
                     })
                     break
 
                 if simple_field_value not in (None, {}, []) and simple_base_norm and sa_norm and simple_base_norm != sa_norm:
-                    repro, cmd = write_marker_and_cmd(endpoint, headers, simple_q_str, field_name, target_arg_name, payload)
+                    marker_path = write_or_update_marker(
+                        endpoint, headers, simple_q_str, field_name, target_arg_name, payload, {}, "RESPONSE_DIFF_SIMPLE", "Simple baseline __typename differs from attack")
+                    cmd = _build_sqlmap_cmd_marker(marker_path)
                     temp_findings[key].append({
                         "field": field_name,
                         "arg": target_arg_name,
@@ -883,11 +1101,11 @@ def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False, cr
                         "base_response": simple_base_resp.get("data"),
                         "attack_response": simple_atk_resp.get("data"),
                         "recommended_cmd": cmd,
-                        "repro": repro,
+                        "repro": marker_path,
                     })
                     break
 
-    # post-process and confirmation rules
+    # finalize with confirmation rules
     final_findings: List[Dict[str, Any]] = []
     for (field_name, arg_name), items in temp_findings.items():
         all_attack_null = True
@@ -909,7 +1127,6 @@ def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False, cr
                 all_attack_null = False
                 break
         if all_attack_null and not any(i.get("type", "").startswith("SQL_ERROR") for i in items):
-            print(Fore.BLUE + Style.DIM + f"[-] Suppressing {field_name}.{arg_name}: all attack responses null/empty and no SQL error.")
             continue
 
         types_present = set(i.get("type") for i in items)
@@ -944,31 +1161,12 @@ def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False, cr
                 final_findings.append(rep)
             continue
 
-        print(Fore.BLUE + Style.DIM + f"[-] Suppressed probable false positive for {field_name}.{arg_name} (signals: {sorted(types_present)})")
-
     return final_findings
 
-
-def print_findings_short(findings: List[Dict[str, Any]], truncate_len: int):
-    if not findings:
-        print(Fore.GREEN + "[*] No obvious SQLi indications were found using the configured payloads.")
-        return
-    print(Fore.RED + Style.BRIGHT + f"\n[!] Found {len(findings)} potential SQL injection findings:\n")
-    for i, f in enumerate(findings, 1):
-        print(Fore.RED + Style.BRIGHT + f"[{i}] {f.get('type')}: " + Style.RESET_ALL + f"{f.get('field')}.{f.get('arg')}")
-        if f.get('args_used'):
-            print(Fore.YELLOW + "    Arguments used:" + Style.RESET_ALL + f" {f.get('args_used')}")
-        ev = f.get('evidence') or ''
-        print(Fore.YELLOW + "    Evidence:" + Style.RESET_ALL + f" {truncate_str(str(ev), truncate_len)}")
-        if f.get('repro'):
-            print(Fore.CYAN + "    Marker request:" + Style.RESET_ALL + f" {f.get('repro')}")
-            print(Fore.CYAN + "    Recommended sqlmap command:" + Style.RESET_ALL)
-            print(Fore.WHITE + Style.DIM + f"    {f.get('recommended_cmd')}")
-        print(Style.DIM + "-" * 80 + Style.RESET_ALL)
-
+# -------------------- CLI / main ------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="GraphQL SQLi mini-detector (general crawler + extractor)")
+    parser = argparse.ArgumentParser(description="GraphQL SQLi mini-detector (compact grouped output)")
     parser.add_argument("endpoint", help="GraphQL endpoint URL")
     parser.add_argument("headers", nargs="?", help="Optional headers JSON", default=None)
     parser.add_argument("--crawl", action="store_true", help="Enable limited crawling to extract outputs and reuse them as inputs (opt-in)")
@@ -980,9 +1178,12 @@ def main():
     args = parser.parse_args()
 
     headers = try_parse_headers(args.headers)
-    findings = run_detector(args.endpoint, headers, crawl=args.crawl, crawl_depth=args.crawl_depth, max_requests=args.max_requests, max_items=args.max_items, crawl_delay=args.crawl_delay, verbose=args.verbose)
-    print_findings_short(findings, TRUNCATE_LEN_DEFAULT)
+    findings = run_detector(args.endpoint, headers, crawl=args.crawl, crawl_depth=args.crawl_depth,
+                            max_requests=args.max_requests, max_items=args.max_items,
+                            crawl_delay=args.crawl_delay, verbose=args.verbose)
 
+    grouped = group_findings_by_param(findings, args.endpoint)
+    print_grouped_summary(grouped)
 
 if __name__ == "__main__":
     main()
