@@ -546,6 +546,7 @@ def group_findings_by_param(findings: List[Dict[str, Any]], endpoint: str) -> Di
         repro = f.get("repro") or ""
         recommended_cmd = f.get("recommended_cmd") or (_build_sqlmap_cmd_marker(repro) if repro else "")
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        confidence = compute_confidence(evidence_type, payload or "", bool(repro))
         occ_list = grouped.setdefault(param, {"occurrences": {}, "aggregate": {}})
         occ_key = f"{field} @ {endpoint}"
         occ = occ_list["occurrences"].setdefault(occ_key, {"field": field, "endpoint": endpoint, "args_context": args_context, "findings": []})
@@ -558,6 +559,7 @@ def group_findings_by_param(findings: List[Dict[str, Any]], endpoint: str) -> Di
             "repro": repro,
             "recommended_cmd": recommended_cmd,
             "timestamp": timestamp,
+            "confidence": confidence,
             "args_used": f.get("args_used")
         })
     for param, data in list(grouped.items()):
@@ -734,7 +736,24 @@ def detect_graphql_syntax_error(resp_data: Dict[str, Any]) -> Optional[str]:
             return msg
     return None
 
-
+def compute_confidence(evidence_type: str, payload: str, has_repro: bool) -> float:
+    weights = {
+        "SQL_ERROR": 0.6,
+        "SQL_ERROR_IN_RESPONSE": 0.6,
+        "SQL_ERROR_IN_RESPONSE_SIMPLE": 0.6,
+        "RESPONSE_DIFF": 0.2,
+        "RESPONSE_DIFF_SIMPLE": 0.1,
+        "NULL_ON_ATTACK": 0.15,
+    }
+    base = weights.get(evidence_type, 0.1)
+    payload_bonus = 0.0
+    if payload and re.search(r"(\bOR\b|\bUNION\b|--|/\*|')", payload, re.I):
+        payload_bonus = 0.1
+    repro_bonus = 0.15 if has_repro else 0.0
+    score = base + payload_bonus + repro_bonus
+    if score > 0.99:
+        score = 0.99
+    return round(score, 2)
 
 # -------------------- Main detection logic --------------------------------
 
