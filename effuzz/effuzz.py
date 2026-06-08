@@ -377,7 +377,7 @@ def main():
             print("[!] Could not obtain schema.", file=sys.stderr)
             sys.exit(1)
         strategy = "error-reconstruction"
-    tag = f" (strategy: {strategy})" if strategy and strategy != "post-json" else ""
+    tag = f" (strategy: {strategy})" if strategy and strategy != "normal" else ""
     print(f"[+] Introspection obtained{tag}.")
 
     schema = core_intro.extract_schema(introspection_data)

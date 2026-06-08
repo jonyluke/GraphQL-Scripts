@@ -349,27 +349,6 @@ def interactive_console(methods: List[Dict[str, Any]],
             print("[!] Unknown command. Type 'help' for the command list.\n")
 
 
-def _confirm_endpoint(url: str, headers: Dict[str, str]) -> None:
-    """Send {__typename} to confirm the URL is a live GraphQL endpoint before introspection."""
-    if requests is None:
-        return
-    try:
-        resp = requests.post(url, headers=headers,
-                             json={"query": "query{__typename}"}, timeout=10)
-        data = resp.json()
-        typename = None
-        if isinstance(data, dict):
-            d = data.get("data") or data
-            if isinstance(d, dict):
-                typename = d.get("__typename")
-        if typename:
-            print(f"[+] Endpoint confirmed — __typename: {typename}")
-        else:
-            print("[!] Endpoint responded but no __typename found. Proceeding anyway.")
-    except Exception as e:
-        print(f"[!] Could not confirm endpoint ({e}). Proceeding with introspection.")
-
-
 def main():
     print_banner()
     print("=== GraphQL Interactive Query Generator ===\n")
@@ -385,7 +364,6 @@ def main():
     args = parser.parse_args()
 
     headers = build_headers(args.header, args.cookie)
-    _confirm_endpoint(args.url, headers)
     print(f"[*] Fetching introspection from {args.url} ...")
     introspection, strategy = core_intro.fetch_with_bypass(args.url, headers)
     if introspection is None:
@@ -395,7 +373,7 @@ def main():
             print("[!] Could not obtain schema.")
             sys.exit(1)
         strategy = "error-reconstruction"
-    tag = f" (strategy: {strategy})" if strategy and strategy != "post-json" else ""
+    tag = f" (strategy: {strategy})" if strategy and strategy != "normal" else ""
     print(f"[+] Schema obtained{tag}.\n")
 
     methods = extract_graphql_queries(introspection)

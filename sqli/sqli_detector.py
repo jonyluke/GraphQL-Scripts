@@ -667,7 +667,7 @@ def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False,
             print(Fore.RED + "[!] Could not obtain schema.")
             return []
         strategy = "error-reconstruction"
-    if strategy and strategy not in ("normal", "post-json"):
+    if strategy and strategy != "normal":
         print(Fore.YELLOW + f"[!] Introspection strategy used: {strategy}")
 
     schema = core_intro.extract_schema(intro_data)
