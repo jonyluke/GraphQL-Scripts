@@ -7,7 +7,7 @@ import json
 import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, urlunparse
 
 try:
     import requests
@@ -328,6 +328,50 @@ def reconstruct_schema_from_errors(
         }],
         "directives": [],
     }}}
+
+
+# ── Endpoint discovery ───────────────────────────────────────────────────────
+
+# Standard paths probed during auto-discovery, in priority order.
+GRAPHQL_PATHS = [
+    "/graphql",
+    "/api/graphql",
+    "/graphiql",
+    "/graphql/console",
+    "/api",
+    "/graphql/api",
+    "/graphql/graphql",
+    "/graphql.php",
+]
+
+
+def ping(url: str, headers: Dict[str, str], timeout: int = 10) -> Optional[str]:
+    """Send {__typename} and return the typename string, or None if not GraphQL."""
+    if requests is None:
+        return None
+    h = {k: v for k, v in (headers or {}).items() if k.lower() != "content-type"}
+    try:
+        resp = requests.post(url, headers=h, json={"query": "{__typename}"}, timeout=timeout)
+        data = resp.json()
+        if isinstance(data, dict):
+            d = data.get("data") or data
+            if isinstance(d, dict):
+                return d.get("__typename")
+    except Exception:
+        pass
+    return None
+
+
+def find_graphql_endpoint(base_url: str, headers: Dict[str, str],
+                          timeout: int = 10) -> Optional[str]:
+    """Silently probe standard paths under base_url and return the first confirmed one."""
+    parsed = urlparse(base_url)
+    base = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+    for path in GRAPHQL_PATHS:
+        candidate = base + path
+        if ping(candidate, headers, timeout):
+            return candidate
+    return None
 
 
 # ── Schema extraction ─────────────────────────────────────────────────────────

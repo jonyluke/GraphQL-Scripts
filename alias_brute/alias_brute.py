@@ -23,12 +23,7 @@ from typing import List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-try:
-    import requests
-except ImportError:
-    print("[!] 'requests' library required. Install with: pip install requests",
-          file=sys.stderr)
-    sys.exit(1)
+import requests
 
 from core.http import build_headers
 from core.output import GREEN, RED, YELLOW, CYAN, RESET

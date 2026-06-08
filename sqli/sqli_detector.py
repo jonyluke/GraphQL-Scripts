@@ -493,7 +493,7 @@ def group_findings_by_param(findings: List[Dict[str, Any]], endpoint: str) -> Di
             "total_evidences": sum(len(o.get("findings", [])) for o in occs),
             "max_confidence": max_conf,
             "fields_affected": len(occs),
-            "severity": "high" if max_conf >= 0.9 else "low",
+            "severity": "high" if max_conf >= 0.75 else "medium" if max_conf >= 0.45 else "low",
             "notes": ""
         }
     return grouped
@@ -509,7 +509,9 @@ def print_grouped_summary(grouped: Dict[str, Any]):
             for fin in occ.get("findings", []):
                 payload = fin.get("payload")
                 payload_display = payload if payload is not None else json.dumps(fin.get("args_used") or {}, ensure_ascii=False)
-                print("  " + Fore.YELLOW + "Payload: " + Style.RESET_ALL + f"{payload_display}")
+                print("  " + Fore.YELLOW + "Payload:  " + Style.RESET_ALL + f"{payload_display}")
+                etype = fin.get("evidence_type") or ""
+                print("  " + Fore.CYAN + "Type:     " + Style.RESET_ALL + etype)
                 evidence = fin.get("evidence") or ""
                 cleaned = re.sub(r"\s+", " ", evidence).strip()
                 cleaned = re.sub(r"\[SQL: .*", "[SQL TRACE]", cleaned, flags=re.S)
@@ -660,6 +662,12 @@ def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False,
     _intro_headers = {"Content-Type": "application/json"}
     _intro_headers.update(headers or {})
     intro_data, strategy = core_intro.fetch_with_bypass(endpoint, _intro_headers, TIMEOUT)
+    if intro_data is None:
+        discovered = core_intro.find_graphql_endpoint(endpoint, _intro_headers, TIMEOUT)
+        if discovered and discovered != endpoint:
+            print(Fore.YELLOW + f"[!] Auto-discovered endpoint: {discovered}")
+            endpoint = discovered
+            intro_data, strategy = core_intro.fetch_with_bypass(endpoint, _intro_headers, TIMEOUT)
     if intro_data is None:
         print(Fore.YELLOW + "[!] All introspection strategies failed — attempting error-based reconstruction...")
         intro_data = core_intro.reconstruct_schema_from_errors(endpoint, _intro_headers, TIMEOUT, verbose=verbose)

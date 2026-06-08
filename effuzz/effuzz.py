@@ -21,28 +21,11 @@ from urllib.parse import urlparse, urlunparse, urlencode
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-try:
-    import requests
-except ImportError:
-    print("[!] 'requests' library required. Install with: pip install requests",
-          file=sys.stderr)
-    sys.exit(1)
+import requests
 
 import core.introspection as core_intro
 from core.http import build_headers
 from core.output import RED, GREEN, YELLOW, BLUE, RESET
-
-# Ordered by likelihood of being a valid GraphQL endpoint
-GRAPHQL_DISCOVERY_PATHS = [
-    "/graphql",
-    "/api/graphql",
-    "/graphiql",
-    "/graphql/console",
-    "/api",
-    "/graphql/api",
-    "/graphql/graphql",
-    "/graphql.php",
-]
 
 
 def print_banner():
@@ -92,21 +75,6 @@ def perform_request(url: str, headers: Dict[str, str], payload: Dict[str, Any],
         return None
 
 
-def _get_typename(url: str, headers: Dict[str, str], timeout: int = 10) -> Optional[str]:
-    """Send {__typename} and return the typename string, or None if not GraphQL."""
-    try:
-        resp = requests.post(url, headers=headers,
-                             json={"query": "query{__typename}"}, timeout=timeout)
-        data = resp.json()
-        if isinstance(data, dict):
-            d = data.get("data") or data
-            if isinstance(d, dict):
-                return d.get("__typename")
-    except Exception:
-        pass
-    return None
-
-
 # --------------------------------------------------------------------------- #
 #  --discover mode                                                             #
 # --------------------------------------------------------------------------- #
@@ -118,40 +86,20 @@ def discover_endpoint(base_url: str, headers: Dict[str, str],
     base = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
 
     print(f"[*] Discovering GraphQL endpoint under {base}")
-    print(f"{'Path':<35} {'Status':<8} {'Confirmed'}")
-    print("-" * 65)
+    print(f"{'Path':<35} {'Confirmed'}")
+    print("-" * 55)
 
     confirmed_url = None
-    for path in GRAPHQL_DISCOVERY_PATHS:
+    for path in core_intro.GRAPHQL_PATHS:
         candidate = base + path
-        try:
-            resp = requests.post(
-                candidate, headers=headers,
-                json={"query": "query{__typename}"}, timeout=timeout,
-            )
-            typename = None
-            try:
-                data = resp.json()
-                if isinstance(data, dict):
-                    d = data.get("data") or data
-                    if isinstance(d, dict):
-                        typename = d.get("__typename")
-            except Exception:
-                pass
-
-            if typename:
-                tag = f"{GREEN}YES — __typename: {typename}{RESET}"
-                if confirmed_url is None:
-                    confirmed_url = candidate
-            else:
-                tag = "no"
-            print(f"{path:<35} {resp.status_code:<8} {tag}")
-        except requests.exceptions.ConnectionError:
-            print(f"{path:<35} {'—':<8} (connection refused)")
-        except requests.exceptions.Timeout:
-            print(f"{path:<35} {'timeout':<8}")
-        except Exception as e:
-            print(f"{path:<35} {'error':<8} {e}")
+        typename = core_intro.ping(candidate, headers, timeout)
+        if typename:
+            tag = f"{GREEN}YES — __typename: {typename}{RESET}"
+            if confirmed_url is None:
+                confirmed_url = candidate
+        else:
+            tag = "no"
+        print(f"{path:<35} {tag}")
 
     print()
     if confirmed_url:
@@ -351,7 +299,7 @@ def main():
     #  Resolve GraphQL endpoint (auto-discover if URL isn't GraphQL)      #
     # ------------------------------------------------------------------ #
     graphql_url = args.url
-    if _get_typename(graphql_url, headers) is None:
+    if core_intro.ping(graphql_url, headers) is None:
         print(f"[!] {graphql_url} did not respond as a GraphQL endpoint — running auto-discovery...")
         confirmed = discover_endpoint(graphql_url, headers)
         if confirmed is None:

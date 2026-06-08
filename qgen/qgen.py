@@ -8,11 +8,6 @@ from typing import Dict, Any, List, Optional
 # Allow running from any working directory
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-try:
-    import requests
-except ImportError:
-    requests = None  # type: ignore
-
 import core.introspection as core_intro
 from core.http import build_headers
 from core.output import RED, BLUE, YELLOW, CYAN, RESET

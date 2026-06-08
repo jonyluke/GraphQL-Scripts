@@ -34,7 +34,7 @@ pip install -r requirements.txt
 ```
 GraphQL-Scripts/
 ├── core/
-│   ├── introspection.py   # Introspection fetch + multi-strategy bypass + error reconstruction
+│   ├── introspection.py   # Introspection fetch, bypass chain, error reconstruction, endpoint discovery
 │   ├── http.py            # Header parsing and cookie file helpers
 │   └── output.py          # ANSI colours and colorama re-exports
 ├── qgen/
@@ -269,6 +269,8 @@ python3 effuzz/effuzz.py --url https://target.com/graphql --match-code 200 --deb
 
 SQL injection detector for GraphQL. Performs introspection, seeds argument values via optional BFS crawling, and tests every string-type argument with a curated set of SQL payloads. Writes reproducible `.http` marker files for sqlmap.
 
+If introspection fails on the given URL, sqli silently probes common GraphQL paths for the endpoint before falling back to error-based schema reconstruction.
+
 ### Usage
 
 ```bash
@@ -306,6 +308,8 @@ admin' --        x' UNION SELECT NULL--
 | `RESPONSE_DIFF_SIMPLE` | `__typename` differs between baseline and attack |
 
 All evidence types go through confirmation rules to reduce false positives before being reported.
+
+Each finding in the summary shows the payload, its evidence type (`SQL_ERROR`, `RESPONSE_DIFF`, etc.), and the truncated evidence text. Severity is rated `high` (confidence ≥ 0.75), `medium` (≥ 0.45), or `low`.
 
 ### Examples
 
