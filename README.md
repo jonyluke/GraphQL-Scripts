@@ -34,7 +34,7 @@ pip install -r requirements.txt
 ```
 GraphQL-Scripts/
 ├── core/
-│   ├── introspection.py   # Fetch, load, save, and bypass-test introspection
+│   ├── introspection.py   # Introspection fetch + multi-strategy bypass + error reconstruction
 │   ├── http.py            # Header parsing and cookie file helpers
 │   └── output.py          # ANSI colours and colorama re-exports
 ├── qgen/
@@ -52,10 +52,10 @@ GraphQL-Scripts/
 ## Recommended workflow
 
 ```
-1. effuzz --discover    →  find the endpoint and map accessible operations
-2. qgen                 →  generate full queries for interesting methods
-3. sqli                 →  probe string arguments for SQL injection
-4. alias_brute          →  brute-force if rate limiting is suspected
+1. effuzz       →  find the endpoint and map accessible operations
+2. qgen         →  generate full queries for interesting methods
+3. sqli         →  probe string arguments for SQL injection
+4. alias_brute  →  brute-force if rate limiting is suspected
 ```
 
 ### End-to-end example
@@ -84,9 +84,51 @@ python3 alias_brute/alias_brute.py https://target.com/graphql \
 
 ---
 
+## Introspection bypass
+
+All three tools (qgen, effuzz, sqli) share the same introspection layer from `core/introspection.py`. When a standard introspection query fails or is blocked, they automatically escalate through a chain of bypass strategies before giving up.
+
+### Strategy chain
+
+**POST JSON — 3 query forms × 7 `__schema` encoding variants (21 attempts)**
+
+| Query form | What it adds |
+|---|---|
+| Plain (default) | No directives section — works on most modern servers |
+| Locations | `directives { name isRepeatable locations }` — Burp Suite form |
+| On-star | `directives { name isRepeatable onField onOperation onFragment }` — older spec |
+
+| `__schema` variant | Example |
+|---|---|
+| Normal | `__schema {` |
+| Newline | `__schema\n{` |
+| Comment | `__schema #bypass\n{` |
+| Double space | `__schema  {` |
+| Tab | `__schema\t{` |
+| Compact | `__schema{` |
+| Double newline | `__schema\n\n{` |
+
+The variant loop runs first (all three forms tried per variant) so a wrong query form is detected after 3 requests, not 21.
+
+**GET and POST form-urlencoded** (4 more attempts after POST JSON fails)
+
+Both bypass CORS preflight and are sometimes accepted when JSON POST is blocked at a WAF or CDN layer.
+
+### Error-based schema reconstruction
+
+If every introspection strategy fails, the tools fall back to reconstructing a partial schema from error messages:
+
+1. **Bogus-field probe** — sends `{ _zzz_nonexistent_probe }` and parses `"Did you mean X?"` suggestions to discover real field names.
+2. **Wordlist batch** — sends batches of ~40 common field names; those that don't produce `"Cannot query field"` errors exist on the server.
+3. **Required-arg discovery** — for each found field, parses `"Argument 'X' of required type 'T'"` errors to recover argument names and types.
+
+The result is a minimal schema that is enough to drive argument-level SQLi testing, even without introspection.
+
+---
+
 ## qgen
 
-Interactive CLI that loads a GraphQL schema (from file or auto-introspection) and generates complete query/mutation documents with all nested fields and example variable values.
+Interactive CLI that fetches a GraphQL schema and generates complete query/mutation documents with all nested fields and example variable values.
 
 ### Usage
 
@@ -102,7 +144,7 @@ python3 qgen/qgen.py --url URL [options]
 | `-H "Name: Value"` | HTTP header, repeatable |
 | `--cookie FILE` | Cookie file (one line) |
 
-Before running introspection, qgen sends `{__typename}` to confirm the endpoint is live. If the standard introspection query is blocked, it automatically retries with the newline-bypass variant (`__schema\n{...}`).
+qgen runs the full [introspection bypass chain](#introspection-bypass) automatically. If every strategy fails it falls back to error-based schema reconstruction. The strategy used is printed only when it differs from a plain POST (i.e. when a bypass was needed).
 
 ### Interactive commands
 
@@ -120,8 +162,8 @@ Before running introspection, qgen sends `{__typename}` to confirm the endpoint 
 $ python3 qgen/qgen.py --url https://target.com/graphql \
     -H "Authorization: Bearer TOKEN"
 
-[+] Endpoint confirmed — __typename: Query
-[+] Introspection obtained.
+[*] Fetching introspection from https://target.com/graphql ...
+[+] Schema obtained.
 [+] Schema loaded: 42 queries, 8 mutations
 
 qgen $ listMethods | grep user
