@@ -5,22 +5,20 @@ import json
 import base64
 import hashlib
 import argparse
+import os
 import time
-import shutil
+import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 from pathlib import Path
 from itertools import product
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import requests
-try:
-    from colorama import init as colorama_init, Fore, Style
-    colorama_init(autoreset=True)
-except Exception:
-    class _Dummy:
-        def __getattr__(self, name): return ""
-    Fore = Style = _Dummy()
+from core.output import Fore, Style
+from core.http import parse_headers_input
 
 INTROSPECTION_QUERY = """
 query IntrospectionQuery {
@@ -96,31 +94,6 @@ INDEX_FILE = "index.json"
 EVIDENCE_MAX_CHARS = 80  # max chars to display for evidence in console
 
 # -------------------- Utilities -------------------------------------------
-
-def try_parse_headers(h: Optional[str]) -> Dict[str, str]:
-    if not h:
-        return {}
-    try:
-        parsed = json.loads(h)
-        if isinstance(parsed, dict):
-            return parsed
-        if isinstance(parsed, list):
-            res = {}
-            for item in parsed:
-                if isinstance(item, dict):
-                    res.update(item)
-            return res
-    except Exception:
-        pass
-    headers = {}
-    for part in re.split(r";|,", h):
-        part = part.strip()
-        if not part:
-            continue
-        if ":" in part:
-            k, v = part.split(":", 1)
-            headers[k.strip()] = v.strip()
-    return headers
 
 def post_graphql(endpoint: str, headers: Dict[str, str], payload: Dict[str, Any], verbose: bool = False) -> Dict[str, Any]:
     h = {"Content-Type": "application/json"}
@@ -1137,21 +1110,58 @@ def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False,
 # -------------------- CLI / main ------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="GraphQL SQLi mini-detector (compact grouped output)")
+    parser = argparse.ArgumentParser(
+        description="GraphQL SQLi detector — tests string arguments with SQL payloads",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python3 sqli/sqli_detector.py https://target.com/graphql\n"
+            "  python3 sqli/sqli_detector.py https://target.com/graphql "
+            "'{\"Authorization\":\"Bearer TOKEN\"}'\n"
+            "  python3 sqli/sqli_detector.py https://target.com/graphql --crawl --verbose\n"
+        ),
+    )
     parser.add_argument("endpoint", help="GraphQL endpoint URL")
-    parser.add_argument("headers", nargs="?", help="Optional headers JSON", default=None)
-    parser.add_argument("--crawl", action="store_true", help="Enable limited crawling to extract outputs and reuse them as inputs (opt-in)")
-    parser.add_argument("--crawl-depth", type=int, default=2, help="Max crawl depth (default: 2)")
-    parser.add_argument("--max-requests", type=int, default=250, help="Maximum number of requests allowed during crawling (default: 250)")
-    parser.add_argument("--max-items", type=int, default=10, help="Max items per list to inspect when extracting values (default: 10)")
-    parser.add_argument("--crawl-delay", type=float, default=0.0, help="Delay in seconds between crawl requests (default: 0.0)")
-    parser.add_argument("--verbose", action="store_true", help="Print queries and debug information")
+    parser.add_argument("headers", nargs="?", default=None,
+                        help="Optional headers as JSON object or 'Name: Value' pairs")
+    parser.add_argument("--crawl", action="store_true",
+                        help="BFS crawl to extract values for smarter argument seeding (opt-in)")
+    parser.add_argument("--crawl-depth", type=int, default=2,
+                        help="Max crawl depth (default: 2)")
+    parser.add_argument("--max-requests", type=int, default=250,
+                        help="Max requests during crawl (default: 250)")
+    parser.add_argument("--max-items", type=int, default=10,
+                        help="Items per list to inspect during crawl (default: 10)")
+    parser.add_argument("--crawl-delay", type=float, default=0.0,
+                        help="Delay between crawl requests in seconds (default: 0.0)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print queries and debug information")
     args = parser.parse_args()
 
-    headers = try_parse_headers(args.headers)
-    findings = run_detector(args.endpoint, headers, crawl=args.crawl, crawl_depth=args.crawl_depth,
-                            max_requests=args.max_requests, max_items=args.max_items,
-                            crawl_delay=args.crawl_delay, verbose=args.verbose)
+    # Validate numeric args
+    if args.crawl_depth < 1:
+        print("[!] --crawl-depth must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.max_requests < 1:
+        print("[!] --max-requests must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.max_items < 1:
+        print("[!] --max-items must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if args.crawl_delay < 0:
+        print("[!] --crawl-delay must be >= 0", file=sys.stderr)
+        sys.exit(1)
+
+    headers = parse_headers_input(args.headers)
+    findings = run_detector(
+        args.endpoint, headers,
+        crawl=args.crawl,
+        crawl_depth=args.crawl_depth,
+        max_requests=args.max_requests,
+        max_items=args.max_items,
+        crawl_delay=args.crawl_delay,
+        verbose=args.verbose,
+    )
 
     grouped = group_findings_by_param(findings, args.endpoint)
     print_grouped_summary(grouped)

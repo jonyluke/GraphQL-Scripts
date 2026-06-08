@@ -1,366 +1,439 @@
 #!/usr/bin/env python3
 """
-effuzz.py - GraphQL endpoint fuzzer
+effuzz.py — GraphQL endpoint fuzzer.
 
-Comportamiento principal:
-- Si se pasa --introspection /ruta/to/file.json, carga ese JSON (valida).
-- Si no se pasa --introspection, realiza automáticamente la consulta de introspección
-  al endpoint definido por --url usando las cabeceras (-H/--header) y --cookie si se proporcionan.
-  Por defecto guarda la introspección en introspection_schema.json (puedes desactivar con --no-save-introspection).
-- Extrae queries y mutations del esquema y realiza una comprobación básica tipo ffuf (envía peticiones y muestra status/size/words/lines).
-- Mantiene opciones: --variables (JSON), --debug, --match-code, --filter-code, -s/--silent.
+Enumerates every query and mutation from the schema and sends a minimal request
+for each, reporting HTTP status/size/words/lines (ffuf-style output).
+
+Extra modes:
+  --discover       Probe common GraphQL paths and confirm with {__typename}
+  --check-methods  Test GET and form-urlencoded support (CSRF surface assessment)
 """
 
+import json
 import os
 import sys
-import json
 import argparse
 import textwrap
-from typing import Dict, Any, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse, urlunparse, urlencode
 
-# Intentar importar requests, indicar al usuario si falta
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 try:
     import requests
-except Exception:
-    requests = None
+except ImportError:
+    print("[!] 'requests' library required. Install with: pip install requests",
+          file=sys.stderr)
+    sys.exit(1)
 
-# ANSI colors
-RED = "\033[31m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
-BLUE = "\033[34m"
-RESET = "\033[0m"
+import core.introspection as core_intro
+from core.http import build_headers
+from core.output import RED, GREEN, YELLOW, BLUE, RESET
+
+# Ordered by likelihood of being a valid GraphQL endpoint
+GRAPHQL_DISCOVERY_PATHS = [
+    "/graphql",
+    "/api/graphql",
+    "/graphiql",
+    "/graphql/console",
+    "/api",
+    "/graphql/api",
+    "/graphql/graphql",
+    "/graphql.php",
+]
+
 
 def print_banner():
     print(textwrap.dedent(f"""
     {YELLOW}
     ███████╗███████╗███████╗██╗   ██╗███████╗███████╗
     ██╔════╝██╔════╝██╔════╝██║   ██║╚══███╔╝╚══███╔╝
-    █████╗  █████╗  █████╗  ██║   ██║  ███╔╝   ███╔╝ 
-    ██╔══╝  ██╔══╝  ██╔══╝  ██║   ██║ ███╔╝   ███╔╝  
+    █████╗  █████╗  █████╗  ██║   ██║  ███╔╝   ███╔╝
+    ██╔══╝  ██╔══╝  ██╔══╝  ██║   ██║ ███╔╝   ███╔╝
     ███████╗██║     ██║     ╚██████╔╝███████╗███████╗
-    ╚══════╝╚═╝     ╚═╝      ╚═════╝╚══════╝╚══════╝
-    {RESET}
-    """))
+    ╚══════╝╚═╝     ╚═╝      ╚═════╝╚══════╝╚══════╝ v1.1
+    {RESET}"""))
 
-# Introspection query (suficientemente completa)
-INTROSPECTION_QUERY = """
-query IntrospectionQuery {
-  __schema {
-    queryType { name }
-    mutationType { name }
-    types {
-      kind
-      name
-      fields(includeDeprecated: true) {
-        name
-        args {
-          name
-          type { kind name ofType { kind name ofType { kind name } } }
-        }
-        type { kind name ofType { kind name } }
-      }
-    }
-  }
-}
-"""
 
-def parse_header_list(headers_list: List[str]) -> Dict[str, str]:
-    """
-    Convierte una lista de 'Name: Value' a dict. Última gana en duplicados.
-    """
-    hdrs: Dict[str, str] = {}
-    for h in headers_list or []:
-        if ":" not in h:
-            print(f"⚠️ Ignorando cabecera malformada (esperado 'Name: Value'): {h}")
-            continue
-        name, value = h.split(":", 1)
-        hdrs[name.strip()] = value.strip()
-    return hdrs
-
-def perform_introspection_request(url: str, headers: Dict[str, str], timeout: int = 15) -> Optional[Dict[str, Any]]:
-    """
-    Realiza la petición POST con la consulta de introspección.
-    Devuelve dict JSON si es válida, o None en fallo.
-    """
-    if requests is None:
-        print("❌ La librería 'requests' es necesaria para obtener introspección automáticamente. Instálala con: pip install requests")
-        return None
-    try:
-        resp = requests.post(url, headers=headers, json={"query": INTROSPECTION_QUERY}, timeout=timeout)
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Error HTTP al solicitar introspección: {e}")
-        return None
-
-    try:
-        data = resp.json()
-    except Exception as e:
-        print(f"❌ La respuesta no es JSON válido: {e}")
-        return None
-
-    if (isinstance(data, dict) and
-        ((data.get("data") and isinstance(data["data"], dict) and "__schema" in data["data"]) or ("__schema" in data))):
-        return data
-
-    print("❌ La respuesta de introspección no contiene '__schema' (no es una introspección GraphQL válida).")
-    return None
-
-def save_introspection_file(data: Dict[str, Any], path: str = "introspection_schema.json") -> None:
-    try:
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, ensure_ascii=False)
-        print(f"✅ Introspection guardada en: {path}")
-    except Exception as e:
-        print(f"⚠️ Falló al guardar introspección en {path}: {e}")
-
-def load_introspection_from_path(path: str) -> Optional[Dict[str, Any]]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data
-    except json.JSONDecodeError:
-        print(f"❌ El archivo de introspección no es JSON válido: {path}")
-        return None
-    except Exception as e:
-        print(f"❌ Error leyendo {path}: {e}")
-        return None
-
-def response_stats(resp: requests.Response) -> (int, int, int):
+def response_stats(resp: requests.Response) -> Tuple[int, int, int]:
     text = resp.text or ""
-    size = len(text)
-    words = len(text.split())
-    lines = text.count("\n") + 1
-    return size, words, lines
+    return len(text), len(text.split()), text.count("\n") + 1
+
 
 def color_status(code: int, resp: requests.Response) -> str:
-    """
-    Devuelve código coloreado acorde al tipo de respuesta.
-    Heurística ligera que intenta imitar comportamiento original.
-    """
     if code == 200:
         try:
-            data = resp.json()
-            if "errors" not in data:
+            if "errors" not in resp.json():
                 return f"{GREEN}{code}{RESET}"
         except Exception:
             pass
         return f"{YELLOW}{code}{RESET}"
-
     if code in (401, 403) or "Method forbidden" in resp.text:
         return f"{RED}{code}{RESET}"
-
     if code in (400, 500):
         return f"{YELLOW}{code}{RESET}"
-
     return str(code)
 
-def build_minimal_query_for_method(method_name: str) -> str:
-    """
-    Construye una query simple para testear el método.
-    Intentamos la forma: query { methodName }
-    Si requiere args o selección, el endpoint responderá con error (400) y eso se reportará.
-    """
-    return f"query {{ {method_name} }}"
 
-def perform_request(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: int = 15) -> Optional[requests.Response]:
-    if requests is None:
-        print("❌ La librería 'requests' es necesaria para ejecutar effuzz. Instálala con: pip install requests")
-        return None
+def build_minimal_query(method_name: str, is_mutation: bool = False) -> str:
+    """Build the simplest possible query for a field to gauge accessibility."""
+    op = "mutation" if is_mutation else "query"
+    return f"{op} {{ {method_name} }}"
+
+
+def perform_request(url: str, headers: Dict[str, str], payload: Dict[str, Any],
+                    timeout: int = 15) -> Optional[requests.Response]:
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        return resp
+        return requests.post(url, headers=headers, json=payload, timeout=timeout)
     except requests.exceptions.RequestException as e:
-        print(f"❌ Error en petición a {url}: {e}")
+        print(f"[!] Request error for {url}: {e}", file=sys.stderr)
         return None
 
-def get_fields_from_schema(schema: Dict[str, Any]) -> (List[str], List[str]):
-    types = schema.get("types", []) if isinstance(schema, dict) else []
-    def get_fields(type_name: str):
-        if not type_name:
-            return []
-        for t in types:
-            if t.get("name") == type_name:
-                return [f["name"] for f in t.get("fields", [])] if t.get("fields") else []
-        return []
-    query_type_name = schema.get("queryType", {}).get("name")
-    mutation_type_name = schema.get("mutationType", {}).get("name")
-    queries = get_fields(query_type_name)
-    mutations = get_fields(mutation_type_name)
-    return queries, mutations
+
+def _get_typename(url: str, headers: Dict[str, str], timeout: int = 10) -> Optional[str]:
+    """Send {__typename} and return the typename string, or None if not GraphQL."""
+    try:
+        resp = requests.post(url, headers=headers,
+                             json={"query": "query{__typename}"}, timeout=timeout)
+        data = resp.json()
+        if isinstance(data, dict):
+            d = data.get("data") or data
+            if isinstance(d, dict):
+                return d.get("__typename")
+    except Exception:
+        pass
+    return None
+
+
+# --------------------------------------------------------------------------- #
+#  --discover mode                                                             #
+# --------------------------------------------------------------------------- #
+
+def discover_endpoint(base_url: str, headers: Dict[str, str],
+                      timeout: int = 10) -> Optional[str]:
+    """Probe standard GraphQL paths and return the first confirmed endpoint URL."""
+    parsed = urlparse(base_url)
+    base = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+
+    print(f"[*] Discovering GraphQL endpoint under {base}")
+    print(f"{'Path':<35} {'Status':<8} {'Confirmed'}")
+    print("-" * 65)
+
+    confirmed_url = None
+    for path in GRAPHQL_DISCOVERY_PATHS:
+        candidate = base + path
+        try:
+            resp = requests.post(
+                candidate, headers=headers,
+                json={"query": "query{__typename}"}, timeout=timeout,
+            )
+            typename = None
+            try:
+                data = resp.json()
+                if isinstance(data, dict):
+                    d = data.get("data") or data
+                    if isinstance(d, dict):
+                        typename = d.get("__typename")
+            except Exception:
+                pass
+
+            if typename:
+                tag = f"{GREEN}YES — __typename: {typename}{RESET}"
+                if confirmed_url is None:
+                    confirmed_url = candidate
+            else:
+                tag = "no"
+            print(f"{path:<35} {resp.status_code:<8} {tag}")
+        except requests.exceptions.ConnectionError:
+            print(f"{path:<35} {'—':<8} (connection refused)")
+        except requests.exceptions.Timeout:
+            print(f"{path:<35} {'timeout':<8}")
+        except Exception as e:
+            print(f"{path:<35} {'error':<8} {e}")
+
+    print()
+    if confirmed_url:
+        print(f"[+] Using confirmed endpoint: {confirmed_url}\n")
+    else:
+        print(f"{RED}[!] No GraphQL endpoint found under {base}{RESET}\n")
+    return confirmed_url
+
+
+# --------------------------------------------------------------------------- #
+#  --check-methods mode (CSRF surface)                                        #
+# --------------------------------------------------------------------------- #
+
+def check_csrf_surface(url: str, headers: Dict[str, str], timeout: int = 10) -> None:
+    """Test whether the endpoint accepts GET queries and form-urlencoded POSTs.
+
+    Both request types bypass CORS preflight and are exploitable for CSRF if the
+    endpoint accepts them and relies solely on session cookies for auth.
+    """
+    print("[*] CSRF surface check:")
+    no_ct_headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+
+    # 1. GET with ?query=...
+    try:
+        get_url = url + "?" + urlencode({"query": "{__typename}"})
+        resp = requests.get(get_url, headers=no_ct_headers, timeout=timeout)
+        typename = None
+        try:
+            data = resp.json()
+            if isinstance(data, dict):
+                d = data.get("data") or data
+                if isinstance(d, dict):
+                    typename = d.get("__typename")
+        except Exception:
+            pass
+        if typename:
+            status = f"{GREEN}ACCEPTS{RESET}  ← CSRF possible if no token validation"
+        elif resp.status_code == 200:
+            status = f"{YELLOW}responded{RESET}  (no __typename, may be partial)"
+        else:
+            status = f"rejected (HTTP {resp.status_code})"
+        print(f"  GET  ?query={{...}}          {status}")
+    except Exception as e:
+        print(f"  GET  ?query={{...}}          error: {e}")
+
+    # 2. POST with application/x-www-form-urlencoded
+    try:
+        form_headers = dict(no_ct_headers)
+        form_headers["Content-Type"] = "application/x-www-form-urlencoded"
+        body = urlencode({"query": "{__typename}"})
+        resp = requests.post(url, headers=form_headers, data=body, timeout=timeout)
+        typename = None
+        try:
+            data = resp.json()
+            if isinstance(data, dict):
+                d = data.get("data") or data
+                if isinstance(d, dict):
+                    typename = d.get("__typename")
+        except Exception:
+            pass
+        if typename:
+            status = f"{GREEN}ACCEPTS{RESET}  ← CSRF possible (no CORS preflight on form POST)"
+        elif resp.status_code == 200:
+            status = f"{YELLOW}responded{RESET}  (no __typename, may be partial)"
+        else:
+            status = f"rejected (HTTP {resp.status_code})"
+        print(f"  POST form-urlencoded        {status}")
+    except Exception as e:
+        print(f"  POST form-urlencoded        error: {e}")
+
+    print()
+
+
+# --------------------------------------------------------------------------- #
+#  Core fuzzing loop                                                           #
+# --------------------------------------------------------------------------- #
+
+def fuzz_fields(url: str, headers: Dict[str, str],
+                fields: List[str], label: str,
+                variables_value: Dict[str, Any],
+                is_mutation: bool,
+                match_codes: Optional[set],
+                filter_codes: Optional[set],
+                silent: bool,
+                debug: bool) -> None:
+    if not fields:
+        print(f"[*] No {label} found in schema.")
+        return
+
+    print(f"\n[*] Fuzzing {label} ({len(fields)}):")
+    print(f"{'Method':<35} {'Type':<10} Status     Size    Words   Lines")
+    print("-" * 80)
+
+    for name in fields:
+        query_str = build_minimal_query(name, is_mutation)
+        payload: Dict[str, Any] = {"query": query_str}
+        if variables_value:
+            payload["variables"] = variables_value
+
+        resp = perform_request(url, headers, payload)
+        if resp is None:
+            print(f"{name:<35} {'mutation' if is_mutation else 'query':<10} {RED}request failed{RESET}")
+            continue
+
+        code = resp.status_code
+        size, words, lines = response_stats(resp)
+        colored = color_status(code, resp)
+
+        if match_codes and code not in match_codes:
+            continue
+        if filter_codes and code in filter_codes:
+            continue
+        if silent and code == 401:
+            continue
+
+        op_label = "mutation" if is_mutation else "query"
+        print(f"{name:<35} {op_label:<10} [Status: {colored}] "
+              f"[Size: {size}] [Words: {words}] [Lines: {lines}]")
+
+        if debug:
+            try:
+                print(json.dumps(resp.json(), indent=2, ensure_ascii=False))
+            except Exception:
+                print(resp.text)
+
+    print("-" * 80)
+
+
+# --------------------------------------------------------------------------- #
+#  main                                                                        #
+# --------------------------------------------------------------------------- #
 
 def main():
     print_banner()
 
-    parser = argparse.ArgumentParser(description="Test GraphQL endpoints using introspection.")
-    # Now introspection is optional: if omitted we will query the endpoint automatically
-    parser.add_argument("--introspection", required=False, help="Path to the introspection JSON file")
-    parser.add_argument("--url", required=True, help="GraphQL endpoint URL")
-
+    parser = argparse.ArgumentParser(
+        description="GraphQL endpoint fuzzer — enumerates operations and checks accessibility",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--url", required=True, metavar="URL",
+                        help="GraphQL endpoint URL (or base URL when --discover is used)")
+    parser.add_argument("--introspection", metavar="FILE",
+                        help="Load schema from file instead of fetching automatically")
+    parser.add_argument("--discover", action="store_true",
+                        help="Probe common GraphQL paths and confirm with {__typename}")
+    parser.add_argument("--check-methods", action="store_true",
+                        help="Test GET and form-urlencoded support (CSRF surface)")
     parser.add_argument("-s", "--silent", action="store_true",
-                        help="Only show endpoints that DO NOT return 401")
-
-    parser.add_argument("--cookie", help="File containing cookie in plain text (one line)")
-    parser.add_argument("--variables", help="JSON file with variables for the payload")
-    parser.add_argument("--debug", action="store_true", help="Show full request and response")
-    parser.add_argument("--match-code", "-mc",
-                        help="Show only responses with matching status codes (e.g., 200,403,500)")
-    parser.add_argument("--filter-code", "-fc",
-                        help="Hide responses with matching status codes (e.g., 401,404)")
-
-    # Support repeated headers -H "Name: Value"
-    parser.add_argument("-H", "--header", action="append", default=[], help="Additional HTTP header to include (can be repeated). Format: 'Name: Value'")
-
-    # Control saving of automatic introspection (default: save)
-    parser.add_argument("--save-introspection", dest="save_introspection", action="store_true", help="Save automatic introspection to introspection_schema.json")
-    parser.add_argument("--no-save-introspection", dest="save_introspection", action="store_false", help="Do not save automatic introspection to disk")
+                        help="Hide 401 responses")
+    parser.add_argument("--cookie", metavar="FILE",
+                        help="Cookie file (one line)")
+    parser.add_argument("--variables", metavar="FILE",
+                        help="JSON file with variables to include in each request")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print full response body for each request")
+    parser.add_argument("--match-code", "-mc", metavar="CODES",
+                        help="Show only these status codes, comma-separated (e.g. 200,400)")
+    parser.add_argument("--filter-code", "-fc", metavar="CODES",
+                        help="Hide these status codes, comma-separated (e.g. 401,404)")
+    parser.add_argument("-H", "--header", action="append", default=[],
+                        metavar="Name: Value",
+                        help="HTTP header (repeatable)")
+    parser.add_argument("--save-introspection", dest="save_introspection",
+                        action="store_true",
+                        help="Save fetched schema to introspection_schema.json (default)")
+    parser.add_argument("--no-save-introspection", dest="save_introspection",
+                        action="store_false",
+                        help="Do not save fetched schema to disk")
     parser.set_defaults(save_introspection=True)
-
     args = parser.parse_args()
 
-    GRAPHQL_URL = args.url
-    INTROSPECTION_FILE = args.introspection
+    # --- Build headers ---
+    if args.cookie and not os.path.isfile(args.cookie):
+        print(f"[!] Cookie file not found: {args.cookie!r}", file=sys.stderr)
+        sys.exit(1)
+    headers = build_headers(args.header, args.cookie)
 
-    match_codes = None
-    if args.match_code:
-        match_codes = set(int(x.strip()) for x in args.match_code.split(",") if x.strip().isdigit())
+    # --- Parse code filters ---
+    def _parse_codes(raw: Optional[str]) -> Optional[set]:
+        if not raw:
+            return None
+        result = set()
+        for tok in raw.split(","):
+            tok = tok.strip()
+            if not tok.isdigit():
+                print(f"[!] Invalid status code in filter: {tok!r}", file=sys.stderr)
+                sys.exit(1)
+            result.add(int(tok))
+        return result
 
-    filter_codes = None
-    if args.filter_code:
-        filter_codes = set(int(x.strip()) for x in args.filter_code.split(",") if x.strip().isdigit())
+    match_codes = _parse_codes(args.match_code)
+    filter_codes = _parse_codes(args.filter_code)
 
-    # Build headers
-    extra_headers = parse_header_list(args.header)
-    HEADERS: Dict[str, str] = {
-        "Content-Type": "application/json"
-    }
-
-    # Cookie file handling: gives precedence to explicit -H Cookie
-    if args.cookie:
-        if not os.path.exists(args.cookie):
-            print(f"❌ Cookie file not found: {args.cookie}")
-            sys.exit(1)
-        with open(args.cookie, "r", encoding="utf-8") as f:
-            cookie_value = f.read().strip()
-        if "Cookie" not in extra_headers:
-            extra_headers["Cookie"] = cookie_value
-
-    HEADERS.update(extra_headers)
-
-    # Load variables file if provided
+    # --- Load variables ---
     variables_value: Dict[str, Any] = {}
     if args.variables:
-        if not os.path.exists(args.variables):
-            print(f"❌ Variables file not found: {args.variables}")
+        if not os.path.isfile(args.variables):
+            print(f"[!] Variables file not found: {args.variables!r}", file=sys.stderr)
             sys.exit(1)
         try:
             with open(args.variables, "r", encoding="utf-8") as f:
                 variables_value = json.load(f)
-        except Exception:
-            print("❌ Variables file is NOT valid JSON.")
+        except (ValueError, OSError) as e:
+            print(f"[!] Variables file is not valid JSON: {e}", file=sys.stderr)
             sys.exit(1)
 
+    graphql_url = args.url
+
+    # ------------------------------------------------------------------ #
+    #  --discover: probe paths and update graphql_url                     #
+    # ------------------------------------------------------------------ #
+    if args.discover:
+        confirmed = discover_endpoint(graphql_url, headers)
+        if confirmed is None:
+            sys.exit(1)
+        graphql_url = confirmed
+
+    # ------------------------------------------------------------------ #
+    #  --check-methods: CSRF surface                                      #
+    # ------------------------------------------------------------------ #
+    if args.check_methods:
+        check_csrf_surface(graphql_url, headers)
+
+    # ------------------------------------------------------------------ #
+    #  Load / fetch introspection                                         #
+    # ------------------------------------------------------------------ #
     introspection_data: Optional[Dict[str, Any]] = None
 
-    # If user provided a file, load it
-    if INTROSPECTION_FILE:
-        if not os.path.exists(INTROSPECTION_FILE):
-            print(f"❌ File not found: {INTROSPECTION_FILE}")
+    if args.introspection:
+        if not os.path.isfile(args.introspection):
+            print(f"[!] Introspection file not found: {args.introspection!r}", file=sys.stderr)
             sys.exit(1)
-        introspection_data = load_introspection_from_path(INTROSPECTION_FILE)
+        introspection_data = core_intro.load_from_file(args.introspection)
         if introspection_data is None:
             sys.exit(1)
-        print(f"✅ Introspection cargada desde: {INTROSPECTION_FILE}")
+        print(f"[+] Schema loaded from file: {args.introspection}")
     else:
-        # No introspection file provided -> perform introspection automatically
-        print(f"[*] No se ha pasado --introspection; intentando obtener introspección desde {GRAPHQL_URL} ...")
-        result = perform_introspection_request(GRAPHQL_URL, HEADERS)
-        if result is None:
-            print("❌ No se pudo obtener la introspección del endpoint. Salida.")
+        print(f"[*] Fetching introspection from {graphql_url} ...")
+        introspection_data, strategy = core_intro.fetch_with_bypass(graphql_url, headers)
+        if introspection_data is None:
+            print("[!] Could not obtain introspection from endpoint.", file=sys.stderr)
             sys.exit(1)
-        introspection_data = result
-        print("✅ Introspection obtenida del endpoint.")
+        tag = " (via newline bypass)" if strategy == "bypass" else ""
+        print(f"[+] Introspection obtained{tag}.")
         if args.save_introspection:
-            save_introspection_file(introspection_data, path="introspection_schema.json")
+            core_intro.save_to_file(introspection_data)
 
-    # Validate introspection structure
-    if not isinstance(introspection_data, dict):
-        print("❌ La introspección cargada no es un objeto JSON válido.")
+    schema = core_intro.extract_schema(introspection_data)
+    if not schema:
+        print("[!] '__schema' not found in introspection.", file=sys.stderr)
         sys.exit(1)
 
-    # Support both shapes: {"data": {"__schema": ...}} or {"__schema": ...}
-    schema = None
-    if "data" in introspection_data and isinstance(introspection_data["data"], dict):
-        schema = introspection_data["data"].get("__schema", {})
-    else:
-        schema = introspection_data.get("__schema", {})
+    types = schema.get("types") or []
 
-    if not isinstance(schema, dict) or not schema:
-        print("❌ No se encontró '__schema' en la introspección o es inválido.")
-        sys.exit(1)
-
-    types = schema.get("types", [])
-
-    # Extract queries and mutations
-    def get_fields(type_name: Optional[str]):
+    def _get_fields(type_name: Optional[str]) -> List[str]:
         if not type_name:
             return []
         for t in types:
             if t.get("name") == type_name:
-                return [f["name"] for f in t.get("fields", [])] if t.get("fields") else []
+                return [f["name"] for f in (t.get("fields") or [])]
         return []
 
-    query_type_name = schema.get("queryType", {}).get("name")
-    mutation_type_name = schema.get("mutationType", {}).get("name")
+    queries = _get_fields((schema.get("queryType") or {}).get("name"))
+    mutations = _get_fields((schema.get("mutationType") or {}).get("name"))
 
-    queries = get_fields(query_type_name) if query_type_name else []
-    mutations = get_fields(mutation_type_name) if mutation_type_name else []
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"\n[+] Schema: {len(queries)} queries, {len(mutations)} mutations")
+    print(f"[*] Target: {graphql_url}  |  {ts}")
 
-    print(f"[✓] Introspection cargada ({len(queries)} queries, {len(mutations)} mutations)")
-    print("------------------------------------------------------------")
+    # ------------------------------------------------------------------ #
+    #  Fuzz                                                               #
+    # ------------------------------------------------------------------ #
+    fuzz_fields(graphql_url, headers, queries, "queries",
+                variables_value, False,
+                match_codes, filter_codes, args.silent, args.debug)
 
-    # ========================================================================
-    # Minimal ffuf-like processing: para cada método en queries, enviamos una petición
-    # y mostramos status/size/words/lines. Este bloque puede ampliarse con payloads,
-    # control de códigos, filtros, etc. (mantiene la funcionalidad básica del original).
-    # ========================================================================
+    fuzz_fields(graphql_url, headers, mutations, "mutations",
+                variables_value, True,
+                match_codes, filter_codes, args.silent, args.debug)
 
-    if not queries:
-        print("⚠️ No se han encontrado queries para probar.")
-    else:
-        print("Probando queries (envío minimal):")
-        for qname in queries:
-            payload_query = build_minimal_query_for_method(qname)
-            payload = {"query": payload_query}
-            # Si variables globales fueron provistas, intentar incluirlas (aunque la query minimal no las usa)
-            if variables_value:
-                payload["variables"] = variables_value
-            resp = perform_request(GRAPHQL_URL, HEADERS, payload)
-            if resp is None:
-                print(f"{qname:30} -> {RED}request failed{RESET}")
-                continue
-            code = resp.status_code
-            size, words, lines = response_stats(resp)
-            colored = color_status(code, resp)
-            # Aplica filtros si están presentes
-            if match_codes and code not in match_codes:
-                continue
-            if filter_codes and code in filter_codes:
-                continue
-            if args.silent and code == 401:
-                continue
+    print("\n[*] effuzz done.")
 
-            print(f"{qname:30} [Status: {colored}] [Size: {size}] [Words: {words}] [Lines: {lines}]")
-
-            if args.debug:
-                try:
-                    print("---- RESPONSE JSON ----")
-                    print(json.dumps(resp.json(), indent=2, ensure_ascii=False))
-                except Exception:
-                    print("---- RESPONSE TEXT ----")
-                    print(resp.text)
-
-    print("------------------------------------------------------------")
-    print("Fin de effuzz. (Este script hace una comprobación básica; modifica el bucle para incluir payloads, concurrencia u otras heurísticas según necesites.)")
 
 if __name__ == "__main__":
     main()
