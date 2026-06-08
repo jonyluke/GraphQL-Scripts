@@ -371,9 +371,13 @@ def main():
     print(f"[*] Fetching introspection from {graphql_url} ...")
     introspection_data, strategy = core_intro.fetch_with_bypass(graphql_url, headers)
     if introspection_data is None:
-        print("[!] Could not obtain introspection from endpoint.", file=sys.stderr)
-        sys.exit(1)
-    tag = " (via newline bypass)" if strategy == "bypass" else ""
+        print("[!] All introspection strategies failed — attempting error-based reconstruction...")
+        introspection_data = core_intro.reconstruct_schema_from_errors(graphql_url, headers)
+        if introspection_data is None:
+            print("[!] Could not obtain schema.", file=sys.stderr)
+            sys.exit(1)
+        strategy = "error-reconstruction"
+    tag = f" (strategy: {strategy})" if strategy and strategy != "post-json" else ""
     print(f"[+] Introspection obtained{tag}.")
 
     schema = core_intro.extract_schema(introspection_data)

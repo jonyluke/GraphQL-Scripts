@@ -661,10 +661,14 @@ def run_detector(endpoint: str, headers: Dict[str, str], crawl: bool = False,
     _intro_headers.update(headers or {})
     intro_data, strategy = core_intro.fetch_with_bypass(endpoint, _intro_headers, TIMEOUT)
     if intro_data is None:
-        print(Fore.RED + "[!] Failed to retrieve schema via introspection.")
-        return []
-    if strategy == "bypass":
-        print(Fore.YELLOW + "[!] Introspection obtained via newline bypass (standard query was blocked).")
+        print(Fore.YELLOW + "[!] All introspection strategies failed — attempting error-based reconstruction...")
+        intro_data = core_intro.reconstruct_schema_from_errors(endpoint, _intro_headers, TIMEOUT, verbose=verbose)
+        if intro_data is None:
+            print(Fore.RED + "[!] Could not obtain schema.")
+            return []
+        strategy = "error-reconstruction"
+    if strategy and strategy not in ("normal", "post-json"):
+        print(Fore.YELLOW + f"[!] Introspection strategy used: {strategy}")
 
     schema = core_intro.extract_schema(intro_data)
     if not schema:
