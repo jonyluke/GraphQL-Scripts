@@ -32,18 +32,6 @@ def print_banner():
 """)
 
 
-def _prompt_introspection_file() -> Dict[str, Any]:
-    """Interactive fallback: ask the user for a path to an introspection JSON file."""
-    while True:
-        path = input("Enter introspection JSON file path: ").strip()
-        if not os.path.isfile(path):
-            print(f"[!] File not found: {path!r}\n")
-            continue
-        data = core_intro.load_from_file(path)
-        if data is not None:
-            print("[+] Introspection loaded.\n")
-            return data
-
 
 def extract_graphql_queries(introspection: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Extract query and mutation fields from an introspection response.
@@ -387,51 +375,24 @@ def main():
     print("=== GraphQL Interactive Query Generator ===\n")
 
     parser = argparse.ArgumentParser(description="GraphQL Introspection CLI — query generator")
-    src = parser.add_mutually_exclusive_group()
-    src.add_argument("--introspection", metavar="FILE",
-                     help="Path to introspection JSON file")
-    src.add_argument("--url", metavar="URL",
-                     help="GraphQL endpoint URL (auto-introspection)")
+    parser.add_argument("--url", metavar="URL", required=True,
+                        help="GraphQL endpoint URL")
     parser.add_argument("-H", "--header", action="append", default=[],
                         metavar="Name: Value",
-                        help="HTTP header for auto-introspection (repeatable)")
+                        help="HTTP header (repeatable)")
     parser.add_argument("--cookie", metavar="FILE",
-                        help="Cookie file (one line) for auto-introspection")
-    parser.add_argument("--save-introspection", dest="save_introspection",
-                        action="store_true",
-                        help="Save fetched introspection to introspection_schema.json (default)")
-    parser.add_argument("--no-save-introspection", dest="save_introspection",
-                        action="store_false",
-                        help="Do not save introspection to disk")
-    parser.set_defaults(save_introspection=True)
+                        help="Cookie file (one line)")
     args = parser.parse_args()
 
-    introspection = None
-
-    if args.introspection:
-        if not os.path.isfile(args.introspection):
-            print(f"[!] File not found: {args.introspection!r}")
-            sys.exit(1)
-        introspection = core_intro.load_from_file(args.introspection)
-        if introspection is None:
-            sys.exit(1)
-        print("[+] Introspection loaded from file.\n")
-
-    elif args.url:
-        headers = build_headers(args.header, args.cookie)
-        _confirm_endpoint(args.url, headers)
-        print(f"[*] Fetching introspection from {args.url} ...")
-        introspection, strategy = core_intro.fetch_with_bypass(args.url, headers)
-        if introspection is None:
-            print("[!] Could not obtain introspection. Falling back to interactive prompt.\n")
-            introspection = _prompt_introspection_file()
-        else:
-            tag = " (via newline bypass)" if strategy == "bypass" else ""
-            print(f"[+] Introspection obtained{tag}.\n")
-            if args.save_introspection:
-                core_intro.save_to_file(introspection)
-    else:
-        introspection = _prompt_introspection_file()
+    headers = build_headers(args.header, args.cookie)
+    _confirm_endpoint(args.url, headers)
+    print(f"[*] Fetching introspection from {args.url} ...")
+    introspection, strategy = core_intro.fetch_with_bypass(args.url, headers)
+    if introspection is None:
+        print("[!] Could not obtain introspection from endpoint.")
+        sys.exit(1)
+    tag = " (via newline bypass)" if strategy == "bypass" else ""
+    print(f"[+] Introspection obtained{tag}.\n")
 
     methods = extract_graphql_queries(introspection)
     if not methods:

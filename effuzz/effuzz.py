@@ -292,11 +292,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--url", required=True, metavar="URL",
-                        help="GraphQL endpoint URL (or base URL when --discover is used)")
-    parser.add_argument("--introspection", metavar="FILE",
-                        help="Load schema from file instead of fetching automatically")
-    parser.add_argument("--discover", action="store_true",
-                        help="Probe common GraphQL paths and confirm with {__typename}")
+                        help="GraphQL endpoint URL (auto-discovery runs if it doesn't respond as GraphQL)")
     parser.add_argument("--check-methods", action="store_true",
                         help="Test GET and form-urlencoded support (CSRF surface)")
     parser.add_argument("-s", "--silent", action="store_true",
@@ -314,13 +310,6 @@ def main():
     parser.add_argument("-H", "--header", action="append", default=[],
                         metavar="Name: Value",
                         help="HTTP header (repeatable)")
-    parser.add_argument("--save-introspection", dest="save_introspection",
-                        action="store_true",
-                        help="Save fetched schema to introspection_schema.json (default)")
-    parser.add_argument("--no-save-introspection", dest="save_introspection",
-                        action="store_false",
-                        help="Do not save fetched schema to disk")
-    parser.set_defaults(save_introspection=True)
     args = parser.parse_args()
 
     # --- Build headers ---
@@ -358,14 +347,15 @@ def main():
             print(f"[!] Variables file is not valid JSON: {e}", file=sys.stderr)
             sys.exit(1)
 
+    # ------------------------------------------------------------------ #
+    #  Resolve GraphQL endpoint (auto-discover if URL isn't GraphQL)      #
+    # ------------------------------------------------------------------ #
     graphql_url = args.url
-
-    # ------------------------------------------------------------------ #
-    #  --discover: probe paths and update graphql_url                     #
-    # ------------------------------------------------------------------ #
-    if args.discover:
+    if _get_typename(graphql_url, headers) is None:
+        print(f"[!] {graphql_url} did not respond as a GraphQL endpoint — running auto-discovery...")
         confirmed = discover_endpoint(graphql_url, headers)
         if confirmed is None:
+            print(f"{RED}[!] No GraphQL endpoint found. Aborting.{RESET}", file=sys.stderr)
             sys.exit(1)
         graphql_url = confirmed
 
@@ -376,28 +366,15 @@ def main():
         check_csrf_surface(graphql_url, headers)
 
     # ------------------------------------------------------------------ #
-    #  Load / fetch introspection                                         #
+    #  Fetch introspection                                                 #
     # ------------------------------------------------------------------ #
-    introspection_data: Optional[Dict[str, Any]] = None
-
-    if args.introspection:
-        if not os.path.isfile(args.introspection):
-            print(f"[!] Introspection file not found: {args.introspection!r}", file=sys.stderr)
-            sys.exit(1)
-        introspection_data = core_intro.load_from_file(args.introspection)
-        if introspection_data is None:
-            sys.exit(1)
-        print(f"[+] Schema loaded from file: {args.introspection}")
-    else:
-        print(f"[*] Fetching introspection from {graphql_url} ...")
-        introspection_data, strategy = core_intro.fetch_with_bypass(graphql_url, headers)
-        if introspection_data is None:
-            print("[!] Could not obtain introspection from endpoint.", file=sys.stderr)
-            sys.exit(1)
-        tag = " (via newline bypass)" if strategy == "bypass" else ""
-        print(f"[+] Introspection obtained{tag}.")
-        if args.save_introspection:
-            core_intro.save_to_file(introspection_data)
+    print(f"[*] Fetching introspection from {graphql_url} ...")
+    introspection_data, strategy = core_intro.fetch_with_bypass(graphql_url, headers)
+    if introspection_data is None:
+        print("[!] Could not obtain introspection from endpoint.", file=sys.stderr)
+        sys.exit(1)
+    tag = " (via newline bypass)" if strategy == "bypass" else ""
+    print(f"[+] Introspection obtained{tag}.")
 
     schema = core_intro.extract_schema(introspection_data)
     if not schema:
