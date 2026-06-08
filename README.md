@@ -61,8 +61,8 @@ GraphQL-Scripts/
 ### End-to-end example
 
 ```bash
-# 1. Discover the endpoint and map permissions
-python3 effuzz/effuzz.py --url https://target.com --discover \
+# 1. Map accessible operations (auto-discovers endpoint if needed)
+python3 effuzz/effuzz.py --url https://target.com \
   -H "Cookie: session=abc123" --filter-code 401
 
 # 2. Check CSRF surface while we're at it
@@ -91,21 +91,18 @@ Interactive CLI that loads a GraphQL schema (from file or auto-introspection) an
 ### Usage
 
 ```bash
-python3 qgen/qgen.py [--introspection FILE | --url URL] [options]
+python3 qgen/qgen.py --url URL [options]
 ```
 
 ### Options
 
 | Flag | Description |
 |---|---|
-| `--introspection FILE` | Load schema from a JSON file |
-| `--url URL` | Fetch schema from the endpoint (auto-introspection) |
+| `--url URL` | GraphQL endpoint URL (required) |
 | `-H "Name: Value"` | HTTP header, repeatable |
 | `--cookie FILE` | Cookie file (one line) |
-| `--save-introspection` | Save fetched schema to `introspection_schema.json` (default: on) |
-| `--no-save-introspection` | Do not save schema to disk |
 
-When `--url` is used, qgen first sends `{__typename}` to confirm the endpoint is live GraphQL before running the full introspection. If the standard introspection query is blocked, it automatically retries with the newline-bypass variant (`__schema\n{...}`).
+Before running introspection, qgen sends `{__typename}` to confirm the endpoint is live. If the standard introspection query is blocked, it automatically retries with the newline-bypass variant (`__schema\n{...}`).
 
 ### Interactive commands
 
@@ -120,7 +117,8 @@ When `--url` is used, qgen first sends `{__typename}` to confirm the endpoint is
 ### Example session
 
 ```
-$ python3 qgen/qgen.py --url https://target.com/graphql -H "Authorization: Bearer TOKEN"
+$ python3 qgen/qgen.py --url https://target.com/graphql \
+    -H "Authorization: Bearer TOKEN"
 
 [+] Endpoint confirmed — __typename: Query
 [+] Introspection obtained.
@@ -165,9 +163,7 @@ python3 effuzz/effuzz.py --url URL [options]
 
 | Flag | Description |
 |---|---|
-| `--url URL` | GraphQL endpoint URL (base URL when `--discover` is used) |
-| `--introspection FILE` | Load schema from file instead of fetching |
-| `--discover` | Probe common GraphQL paths and confirm each with `{__typename}` |
+| `--url URL` | GraphQL endpoint URL or base URL (e.g. `https://target.com`) |
 | `--check-methods` | Test GET query-param and form-urlencoded POST support (CSRF surface) |
 | `-H "Name: Value"` | HTTP header, repeatable |
 | `--cookie FILE` | Cookie file (one line) |
@@ -176,19 +172,17 @@ python3 effuzz/effuzz.py --url URL [options]
 | `--match-code CODES` | Show only these status codes (e.g. `200,400`) |
 | `--filter-code CODES` | Hide these status codes (e.g. `401,403`) |
 | `--debug` | Print full response body for each request |
-| `--save-introspection` | Save schema to disk (default: on) |
-| `--no-save-introspection` | Do not save schema |
 
-### --discover
+### Auto-discovery
 
-Probes the following paths and confirms each with `{__typename}`:
+If `--url` doesn't respond as a GraphQL endpoint, effuzz automatically probes these paths and uses the first one that replies with a valid `__typename`:
 
 ```
 /graphql  /api/graphql  /graphiql  /graphql/console
 /api      /graphql/api  /graphql/graphql  /graphql.php
 ```
 
-The first confirmed endpoint is used for fuzzing. Pass the base URL (e.g. `https://target.com`).
+You can pass either the full endpoint (`https://target.com/graphql`) or just the base URL (`https://target.com`) — discovery handles both.
 
 ### --check-methods (CSRF surface)
 
@@ -202,8 +196,8 @@ If either is accepted and auth relies solely on session cookies, CSRF is likely 
 ### Examples
 
 ```bash
-# Discover endpoint path first, then fuzz
-python3 effuzz/effuzz.py --url https://target.com --discover \
+# Auto-discover endpoint and fuzz (pass base URL or full path — both work)
+python3 effuzz/effuzz.py --url https://target.com \
   -H "Authorization: Bearer TOKEN"
 
 # Check CSRF surface
@@ -213,9 +207,8 @@ python3 effuzz/effuzz.py --url https://target.com/graphql --check-methods
 python3 effuzz/effuzz.py --url https://target.com/graphql \
   --filter-code 401,403 -H "Authorization: Bearer TOKEN"
 
-# Load saved schema, debug first result
-python3 effuzz/effuzz.py --url https://target.com/graphql \
-  --introspection introspection_schema.json --match-code 200 --debug
+# Debug: print full response body for each method
+python3 effuzz/effuzz.py --url https://target.com/graphql --match-code 200 --debug
 ```
 
 ### Output interpretation
